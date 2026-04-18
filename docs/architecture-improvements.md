@@ -2,8 +2,15 @@
 
 Running list of improvements to the WhatsApp voice bot architecture,
 captured during a 2026-04-18 design review. Organized by priority
-(highest-leverage first). Not implemented yet — this doc is the
-backlog.
+(highest-leverage first).
+
+**Status legend**: `[done]` shipped; `[todo]` pending. Items without a
+status marker are untouched.
+
+**Progress so far** (as of 2026-04-18):
+- Items 1, 2, 4, 5 shipped in commit `19005e4`
+- Remaining Top-5: item 3 (`Messenger` interface)
+- All Medium / Low items still pending
 
 Related docs:
 - `contact-memory.md` — contact memory system design (v1 implemented,
@@ -13,41 +20,40 @@ Related docs:
 
 ## The 5 highest-leverage improvements
 
-### 1. Git-version the memory files
+### 1. Git-version the memory files `[done]`
 
-**Problem.** Claude's `Edit` tool could silently drop facts or corrupt
-a file on a bad rewrite and we'd never notice.
+**Shipped in `19005e4` (2026-04-18).** Memory writes now auto-commit
+via `execFileSync('git', ['add', '-f', ...])` + `execFileSync('git',
+['commit', '-m', subject, '-m', body])` inside
+`src/memory-guard.ts`. Commit subjects are `memory: create <jid>` or
+`memory: update <jid>`, with body containing the reason + previous/new
+sha256 hashes. Files are force-added despite `data/contacts/` being
+gitignored, so history is local-only (not pushed to a remote).
+Git failures are non-fatal: status downgrades to `'written'`, the
+write itself persists.
 
-**Fix.** Either make `data/contacts/` a nested git repo, or auto-commit
-after every reply to the main repo. Every memory update becomes a diff
-with a timestamp and a readable commit message like
-`memory: update 5511987654321@c.us after reply in mgz`.
-
-**Why it matters.** Rollback is `git revert`. Audit is `git log -- data/contacts/5511987654321@c.us.md`.
-
-**Cost.** ~20 minutes. No behavior change, pure safety net.
-
-**Risks.** Adds one subprocess per reply. If git operations fail, we
-should log and continue — memory update is already best-effort.
+**Known limitation.** Claude's `Edit`/`Write` tool calls inside
+`callClaudeWithTools` bypass this guard entirely. Only
+`memory-bootstrap.ts` and `!remember` commands go through the
+guarded/git-versioned path. Post-claude diff validation is a follow-up
+(TODO noted in `src/index.ts`).
 
 ---
 
-### 2. Corruption guard on Edit
+### 2. Corruption guard on Edit `[done]`
 
-**Problem.** Even with git versioning, we'd like to detect obvious
-regressions at write time rather than after the fact.
+**Shipped in `19005e4` (2026-04-18).** `src/memory-guard.ts`
+implements four rejection rules applied before write:
+1. Empty or whitespace-only output
+2. Shrinkage by >30% on files that had >200 chars originally
+3. Missing `## Identity` header when the old file had one
+4. Output exceeds 8192 chars (2× the 4KB target)
 
-**Fix.** Before each Claude call, snapshot the current file. After,
-compare:
-- File shrank by >30%? → roll back
-- `## Identity` header disappeared? → roll back
-- Total chars > 8KB (2× our 4KB target)? → ask Claude to compact
-  before writing
+Rejected writes return `{ status: 'rejected', reason }` and leave the
+previous file intact. Callers decide what to do with rejections
+(`!remember` surfaces the error back to Nick; bootstrap logs + skips).
 
-Log loudly on any revert — these signals mean something upstream is
-going wrong.
-
-**Cost.** ~30 minutes. Trust-but-verify without blocking the hot path.
+Same caveat as item 1: Claude's in-tool Edits bypass this guard.
 
 ---
 
@@ -87,91 +93,58 @@ handler.
 
 ---
 
-### 4. Structured logs + `npm run stats`
+### 4. Structured logs + `npm run stats` `[done]`
 
-**Problem.** Logs are scattered `console.log` lines. No cost tracking,
-no reply-rate metric, no way to answer "how often does the bot
-misfire?".
+**Shipped in `19005e4` (2026-04-18).**
+- `src/events.ts` — `logEvent()` appends JSONL to `data/events.jsonl`.
+  Never throws (IO errors go to stderr only). Additive: console.log
+  lines kept for human readability.
+- Instrumented sites: `reply.sent`, `reply.silent`, every `skip.*`
+  reason, `claude.call` (with `variant: 'no-tools' | 'with-tools'` and
+  `duration_ms`), `bootstrap.contact_written`/`_skipped`,
+  `memory.written`/`rejected`/`git_failed`, `command.received`/
+  `executed`/`failed`, generic `error`.
+- `src/stats.ts` + `npm run stats [--window 24h|7d|30d|all]` —
+  reply counts, skip breakdown by reason, claude-call p50/p95/p99 +
+  slowest call, memory update counts, command counts, error list.
+  Malformed lines are skipped with a stderr warning.
 
-**Fix.** Every notable event (mention seen, reply sent, memory
-updated, command executed, error) writes one line to
-`data/events.jsonl` with fields:
-- `ts` — ISO timestamp
-- `kind` — e.g. `reply`, `skip.rate_limit`, `skip.not_mentioned`, `command`, `error`
-- `chat` — chat name + id
-- `sender` — display name + jid
-- `trigger` — `mention` | `reply` | null
-- `claude_duration_ms` — for reply/memory calls
-- `tokens_in`, `tokens_out` — parse from claude JSON output
-- `cost_usd` — computed from token counts and current pricing
-- Any kind-specific fields
-
-Then `npm run stats`:
-- Replies per day / week
-- Running cost estimate
-- Skip breakdown by reason (rate-limit vs. not-mentioned vs. ...)
-- Top 10 most-mentioned groups
-- Most-updated contact files
-- Slowest claude calls (p50/p95/p99)
-
-**Why it matters.** Without this you won't notice cost creep,
-silent regressions, or "why is the bot suddenly not replying in mgz?".
-
-**Cost.** 1-2 hours. Schema design + a simple parser script.
-
-**Implementation note.** Prefer `data/events.jsonl` over a database.
-JSONL is grep-friendly and rotates cleanly (cron: split by month).
+**Not yet captured**: `tokens_in` / `tokens_out` / `cost_usd` — the
+`claude -p --output-format text` we use doesn't expose usage. Switch
+to `--output-format json` + parse in a follow-up to wire up cost
+tracking.
 
 ---
 
-### 5. Command-mode DMs via WhatsApp self-chat
+### 5. Command-mode DMs via WhatsApp self-chat `[done]`
 
-**Problem.** No way to correct or query the bot without editing files
-on disk. Can't teach it new facts while on the go.
+**Shipped in `19005e4` (2026-04-18).** `src/commands.ts` implements
+the dispatcher; `src/index.ts` has the self-chat gate (fromMe + chat
+id matches `ownerCusId` + body starts with `!`) placed before the
+group gate.
 
-**Fix.** Listen for messages Nick sends to HIMSELF on WhatsApp (the
-"Message Yourself" chat). Any such message starting with `!` is a
-command, not a mention.
+**Security verified.** Messages in any other chat starting with `!`
+are ignored. Only Nick's authenticated session produces `fromMe`
+messages, matching the expected cryptographic guarantee.
 
-Handler flow update:
-```
-message_create event
-├─ is self-chat (chat.id === ownerCusId) AND fromMe AND body starts with "!"
-│    → command dispatcher
-├─ is group AND not fromMe AND (mentioned OR reply-to-owner)
-│    → reply path (current)
-└─ else → ignore
-```
+**Commands shipped:**
 
-**Security model.** Only Nick can send `fromMe` messages (cryptographic
-guarantee from WhatsApp E2E signing). No one else can impersonate the
-command channel. No secret/password needed. Compromising the command
-channel requires compromising Nick's WhatsApp Web session itself, at
-which point all bets are off anyway.
-
-**Commands to implement first:**
-
-| Command | Effect |
+| Command | Status |
 |---|---|
-| `!help` | List available commands |
-| `!remember <jid-or-name> <fact>` | Append fact to Facts section, update Last updated |
-| `!forget <jid>` | Delete `data/contacts/<jid>.md` |
-| `!who <jid-or-name>` | Bot replies (in self-chat) with the memory file contents |
-| `!status` | Last-24h summary: replies, groups, contacts updated |
-| `!silence <group-name> <duration>` | Stop replying in that group for N minutes |
-| `!silence all <duration>` | Global mute |
-| `!resume` | Clear all silences |
-| `!bootstrap` | Trigger memory:bootstrap in-process (no restart) |
-| `!voice refresh` | Re-run voice profile against last 60 days |
+| `!help` | `[done]` |
+| `!remember <jid> <fact>` | `[done]` (reports guard rejection explicitly) |
+| `!forget <jid>` | `[done]` |
+| `!who <jid\|name>` | `[done]` (name search greps file *content*, not filenames — known minor) |
+| `!status` | `[done]` (delegates to `formatStats`) |
+| `!silence <chat\|all> <duration>` | `[done]` (keys normalized via `normalizeChatKey`) |
+| `!resume` | `[done]` |
+| `!bootstrap` | `[todo]` — deferred |
+| `!voice refresh` | `[todo]` — deferred |
 
-**Gotcha.** The bot replying to `!who` will itself produce a `fromMe`
-message in the self-chat. To prevent recursion: the bot's own replies
-never start with `!`, plus track recent outbound message IDs in an
-in-memory set to double-skip them if they round-trip through
-`message_create`.
-
-**Cost.** 2-3 hours for the dispatcher + first 4-5 commands. The rest
-as layered additions.
+**Recursion guard.** Outbound message IDs tracked in a bounded Set
+(`recentOutboundIds`, cap 100, LRU-ish eviction). Covers both
+`msg.reply()` (group replies) and `chat.sendMessage()` (command
+replies). Bot's own replies never start with `!` as an extra layer.
 
 ---
 
@@ -324,15 +297,32 @@ contacts or cross-reference becomes a common manual operation.
 
 ## Recommended sequencing (if tackling one per session)
 
-1. **#1 + #2 — Git-version + corruption guard** (~1 hour together).
-   Pure safety net. Do first so nothing else can silently break memory.
-2. **#4 — Structured logs + stats** (~1-2 hours). Unblocks visibility
-   for everything after. You can't optimize what you can't see.
-3. **#5 — Self-chat command mode** (~2-3 hours). Massive UX win for
-   teaching/correcting the bot without dropping to a shell.
+1. ~~**#1 + #2 — Git-version + corruption guard**~~ `[done in 19005e4]`
+2. ~~**#4 — Structured logs + stats**~~ `[done in 19005e4]`
+3. ~~**#5 — Self-chat command mode**~~ `[done in 19005e4]`
 4. **#3 — Messenger interface + first integration test** (~3-4 hours).
    Long-term insurance against library churn. Unlocks testability.
+   **Next up.**
 5. **Everything else** as-needed, driven by pain points #4 surfaces.
+
+## Follow-up work surfaced during the 19005e4 batch
+
+From the code review (tracked in `tasks/main/review-report.md`):
+
+- **Add `tokens_in`/`tokens_out`/`cost_usd` to events** by switching
+  claude subprocess to `--output-format json` and parsing usage. Lets
+  `npm run stats` report actual cost.
+- **Post-claude memory-guard hook.** Claude's in-tool `Edit`/`Write`
+  calls currently bypass the corruption guard (only bootstrap and
+  `!remember` go through it). Add a post-subprocess git-diff
+  inspector that validates any changes to `data/contacts/` against
+  the corruption rules retroactively.
+- **Minor polish**: strict `msg.fromMe === true`, help-text escape
+  (currently relies on outbound-ID guard alone), `!who <name>` should
+  match filenames not contents, bootstrap guard-rejection counter
+  currently merged into "claude-empty" counter.
+- **Missing tests**: `!silence <bad-duration>`, dispatcher error-path
+  reply.
 
 ---
 

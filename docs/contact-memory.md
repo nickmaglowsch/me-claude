@@ -21,13 +21,35 @@ model of *who he's talking to*. A good reply in a group depends on:
 Without this, the bot always sounds like Nick meeting this person for
 the first time.
 
-## Version picked for v1 (2026-04-18)
+## Version picked for v1 (2026-04-18) `[done]`
 
-1. **Scope**: groups only (same trigger surface as today — no passive DM observation)
-2. **Bootstrap**: yes — `npm run memory:bootstrap` scans chat history and seeds files
-3. **Cadence**: per-reply — every bot reply triggers a memory update for the sender
-4. **Injection**: only when we have info — no `{CONTACT_CONTEXT}` section in the prompt if no relevant memory file exists
-5. **Separation**: voice profile stays at `data/voice_profile.md`; contact memories go in `data/contacts/` (different concerns)
+1. **Scope**: groups only (same trigger surface as today — no passive DM observation) `[done]`
+2. **Bootstrap**: yes — `npm run memory:bootstrap` scans chat history and seeds files `[done]`
+3. **Cadence**: per-reply — every bot reply triggers a memory update for the sender `[done]`
+4. **Injection**: only when we have info — no context block in the prompt if no relevant memory file exists `[done, but implementation diverged — see note below]`
+5. **Separation**: voice profile stays at `data/voice_profile.md`; contact memories go in `data/contacts/` (different concerns) `[done]`
+
+**Divergence from original v1 plan.** The v1 design assumed pre-loading
+contact files into the prompt via a `{CONTACT_CONTEXT}` placeholder
+and a second claude call (`MEMORY_UPDATE_PROMPT`) to rewrite the file.
+What actually shipped (in `3ed7883`) is **tool-access** instead:
+`callClaudeWithTools` gives claude `Read`/`Edit`/`Write`/`Grep`/`Glob`
+access so it reads the relevant file itself and makes surgical edits.
+Net effect: 1 claude call per reply (was 2), claude chooses what to
+read (zero cost when no relevant file exists), and edits are
+precise rather than full rewrites. The `MEMORY_UPDATE_PROMPT` is
+still used by bootstrap and by the `!remember` command. See commit
+`3ed7883` and `docs/architecture-improvements.md` for the tool-access
+switch rationale.
+
+**Also shipped later**:
+- `cf0a50b` — v1 core implementation (pre-tool-access version)
+- `3ed7883` — switched runtime to tool access
+- `953e556` — bootstrap rewritten to aggregate across all groups per
+  contact (single file per person regardless of how many groups they
+  share with Nick)
+- `19005e4` — memory-guard safety net around bootstrap writes and
+  `!remember` command (see architecture-improvements.md items 1, 2)
 
 ## Storage
 
