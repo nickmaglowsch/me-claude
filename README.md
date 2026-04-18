@@ -122,6 +122,48 @@ Messages you send in group chats or DMs to other people that start with `!` are 
 !resume               # unmute everything immediately
 ```
 
+## Ambient replies (opt-in)
+
+Beyond mention/reply triggers, the bot can chime in on plain messages
+that seem to be about you or about topics you care about. Off by default.
+
+### Enable
+
+```
+!ambient on              # turn on globally (applies to all groups you're in)
+!ambient off             # master kill switch
+!ambient off <chat>      # disable for a specific group
+!ambient on <chat>       # re-enable for a previously-disabled group
+!ambient status          # show current config
+!ambient cap <n>         # change daily reply cap (default 30)
+!ambient threshold <n>   # change fuzzy-match threshold, 0-1 (default 0.5)
+!ambient refresh         # re-extract topics from voice profile + memory
+```
+
+### Topic list
+
+The fuzzy-match bank is built from three sources merged together:
+1. Explicit topics you add via `!topic add`
+2. Auto-extracted from your voice profile (refreshed on voice-profile change)
+3. Aggregated `## Recurring topics` sections across all contact memory files
+
+```
+!topic add tennis
+!topic add crypto
+!topic list
+!topic remove tennis
+```
+
+### How it works
+
+1. A plain message (no mention, no reply to your message) arrives in a group
+2. Fuzzy-match the body against the merged topic bank
+3. If score >= threshold, call claude with an ambient-flavored prompt that
+   strongly prefers silence
+4. Claude decides: reply or stay silent. Most of the time: silent.
+5. Daily cap of 30 ambient replies prevents runaway chatter; existing 10s
+   per-group rate limit still applies.
+
 ## Development
 
 ```bash

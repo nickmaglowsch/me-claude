@@ -8,3 +8,4 @@ data/contacts/
 .claude/
 *.log
 data/events.jsonl
+data/ambient-config.json

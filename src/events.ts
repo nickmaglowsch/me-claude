@@ -19,7 +19,12 @@ export type EventKind =
   | 'bootstrap.contact_written'
   | 'bootstrap.contact_skipped'
   | 'claude.call'
-  | 'error';
+  | 'error'
+  | 'ambient.skipped'
+  | 'ambient.considered'
+  | 'ambient.replied'
+  | 'ambient.declined'
+  | 'skip.ambient_disabled';
 
 export interface EventBase {
   ts: string;
@@ -28,7 +33,7 @@ export interface EventBase {
   chat_id?: string;
   sender_name?: string;
   sender_jid?: string;
-  trigger?: 'mention' | 'reply';
+  trigger?: 'mention' | 'reply' | 'ambient';
   duration_ms?: number;
   tokens_in?: number;
   tokens_out?: number;

@@ -1,259 +1,197 @@
-# Code Review Report
+# Code Review Report — Ambient Reply Feature
 
 ## Summary
 
-The batch implements all four planned improvements (items 1, 2, 4, 5) with good test coverage, a clean event schema, and a correctly-scoped self-chat command gate. The build is green, 134/134 tests pass, and the new modules (`events.ts`, `memory-guard.ts`, `commands.ts`, `stats.ts`) are well-factored.
-
-Not shippable as-is. There are two **Critical** issues — a shell-injection surface in `gitCommit` via `execSync` with interpolated strings, and `!remember` falsely confirming success even when the corruption guard rejects the write — plus a handful of **Important** bugs (duplicated `command.received` events, divergent silence key semantics, help-text containing `!` that weakens the defense-in-depth recursion guard).
-
----
+The ambient reply feature is implemented cleanly across both tasks and is close to ship-ready. 196/196 tests pass, build is clean, safety defaults are correct (`masterEnabled: false`), gate ordering matches spec, atomic writes are used, and the runtime integration respects existing gates (group, fromMe, rate-limit, silence). One small user-visible arithmetic bug in `!ambient status` (negative memory count when sources overlap) and a handful of minor polish items. No critical issues.
 
 ## PRD Compliance
 
-### Task 01 — Memory Guard
-
 | # | Requirement | Status | Notes |
-|---|---|---|---|
-| 01.1 | `guardedWriteContactMemory` + `writeContactMemoryGuarded` exported | ✅ Complete | `src/memory-guard.ts:96,166`, re-exported from `src/memory.ts:52` |
-| 01.2 | Empty/whitespace rejection | ✅ Complete | `src/memory-guard.ts:102-105` |
-| 01.3 | >8KB rejection | ✅ Complete | `src/memory-guard.ts:108-113` |
-| 01.4 | Shrinkage >30% on old>200 chars | ✅ Complete | `src/memory-guard.ts:124-132` |
-| 01.5 | Missing `## Identity` header rejection | ✅ Complete | `src/memory-guard.ts:135-145` |
-| 01.6 | Atomic tmp+rename write | ✅ Complete | `src/memory-guard.ts:40-47` |
-| 01.7 | `git add -f` used to bypass gitignore | ✅ Complete | `src/memory-guard.ts:80` |
-| 01.8 | Git failures non-fatal, return `'written'` | ✅ Complete | `src/memory-guard.ts:156-161` |
-| 01.9 | Commit subject uses `create` / `update` | ✅ Complete | `src/memory-guard.ts:54-58` |
-| 01.10 | `memory-bootstrap.ts` uses guarded path | ✅ Complete | `src/memory-bootstrap.ts:233` |
-| 01.11 | TODO in `index.ts` noting tool-use writes bypass guard | ✅ Complete | `src/index.ts:77-80` |
-| 01.12 | Implementation Notes document writeContactMemory decision | ❌ Missing | `tasks/main/implementation-notes.md` does not exist |
+|---|-------------|--------|-------|
+| 1 | `src/fuzzy.ts` exports normalize, diceSimilarity, bestFuzzyMatch | Complete | Plus `FuzzyMatch` interface |
+| 2 | `src/ambient.ts` exports listed functions + AmbientConfig | Complete | All present |
+| 3 | Config I/O uses atomic tmp+rename | Complete | `saveAmbientConfig` uses `tmp-<pid>-<ts>` then `rename` |
+| 4 | `shouldAmbientReply` implements all 6 gates in order | Complete | master → disabledGroups → dailyCap → short msg → empty bank → fuzzy |
+| 5 | `loadMemoryTopics` parses `## Recurring topics` sections | Complete | Case-insensitive header match, stops at next `##` |
+| 6 | `buildTopicBank` merges + dedupes 3 sources | Complete | Lowercases+trims each entry; dedups via Set |
+| 7 | `AMBIENT_PROMPT_PREFIX` + `VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT` exported | Complete | Text matches spec verbatim |
+| 8 | EventKind gains 5 new values | Complete | All five added as pure union additions |
+| 9 | `.gitignore` has `data/ambient-config.json` | Complete | Line 11 |
+| 10 | Default `masterEnabled = false` | Complete | `defaultAmbientConfig()` returns false |
+| 11 | `!ambient on/off/on<chat>/off<chat>/status/cap/threshold/refresh` | Complete | All sub-commands implemented |
+| 12 | `!topic add/remove/list` | Complete | All sub-commands implemented |
+| 13 | Chat-name normalization (lowercase+trim) for disabledGroups | Complete | Uses `normalizeChatKey` in both store + lookup |
+| 14 | Ambient path runs ONLY after group-check and fromMe-check | Complete | Ambient path at line 215-252, after gates 1 & 2 |
+| 15 | `AMBIENT_PROMPT_PREFIX` prepended only when trigger==='ambient' | Complete | Ternary on line 331-332 |
+| 16 | Rate-limit (10s) still applies to ambient | Complete | Rate-limit check happens AFTER ambient gate at line 259 |
+| 17 | Successful ambient reply records to repliesToday and emits ambient.replied | Complete | Lines 368-372 |
+| 18 | Empty claude response for ambient emits ambient.declined | Complete | Lines 340-343 |
+| 19 | Ambient skipped emits ambient.skipped with reason | Complete | Lines 231-239 |
+| 20 | No hardcoded reply prefix ("falando nisso") — voice profile governs | Complete | Prompt instructs Claude NOT to use that phrase |
+| 21 | `!ambient on` = global; `!ambient off <chat>` = per-group opt-OUT | Complete | Blocklist semantics verified |
+| 22 | Fuzzy with threshold, not substring | Complete | Dice bigram similarity with configurable threshold |
+| 23 | `extractVoiceProfileTopics` + `maybeRefreshVoiceProfileTopics` | Complete | Mtime-gated refresh, returns [] on failure, never throws |
+| 24 | README has Ambient Replies section | Complete | Lines 125-165 |
+| 25 | `npm run build` exits 0 | Complete | Verified |
+| 26 | `npm test` passes (existing 139 + new) | Complete | 196/196 pass |
 
-**Compliance**: 11/12.
-
-### Task 02 — Events + Stats
-
-| # | Requirement | Status | Notes |
-|---|---|---|---|
-| 02.1 | `events.ts` exports logEvent, EventKind, EventBase, EVENTS_FILE, getEventsPath | ✅ Complete | `src/events.ts:4-44` |
-| 02.2 | Appends JSONL, creates parent dir, never throws | ✅ Complete | `src/events.ts:46-60` |
-| 02.3 | `skip.not_in_group` logged | ✅ Complete | `src/index.ts:180` |
-| 02.4 | `skip.from_me` logged | ✅ Complete | `src/index.ts:187` |
-| 02.5 | `skip.not_mentioned` logged | ✅ Complete | `src/index.ts:208` |
-| 02.6 | `skip.rate_limited` logged | ✅ Complete | `src/index.ts:219` |
-| 02.7 | `reply.sent` logged | ✅ Complete | `src/index.ts:321-329` |
-| 02.8 | `reply.silent` logged | ✅ Complete | `src/index.ts:296-305` |
-| 02.9 | `error` logged in outer catch | ✅ Complete | `src/index.ts:332` |
-| 02.10 | `claude.call` logged in claude.ts | ✅ Complete | `src/claude.ts:54` |
-| 02.11 | bootstrap.contact_written / skipped logged | ✅ Complete | `src/memory-bootstrap.ts:181,187,243,248` |
-| 02.12 | `npm run stats` works | ✅ Complete | `src/stats.ts:318-340`, `package.json:9` |
-| 02.13 | `.gitignore` has `data/events.jsonl` | ✅ Complete | `.gitignore:10` |
-| 02.14 | Window filter (24h/7d/30d/all) | ✅ Complete | `src/stats.ts:7-20` |
-| 02.15 | Percentile calc | ✅ Complete | `src/stats.ts:57-66` |
-| 02.16 | Malformed line skip | ✅ Complete | `src/stats.ts:111-114` |
-| 02.17 | Original `console.log` statements retained (additive logging) | ✅ Complete | `src/index.ts:212,218,320`; `src/claude.ts` is new logging only, no console.log removed |
-
-**Compliance**: 17/17. (But see Issue on duplicate `command.received`.)
-
-### Task 03 — Commands
-
-| # | Requirement | Status | Notes |
-|---|---|---|---|
-| 03.1 | `parseCommand` / `dispatchCommand` / types exported | ✅ Complete | `src/commands.ts:12-53` |
-| 03.2 | Self-chat gate: fromMe + self-chat + startsWith `!` | ⚠️ Partial | Gate uses `msg.fromMe` (truthy) instead of `msg.fromMe === true` as specified. Practically equivalent but diverges from spec (§3.1). |
-| 03.3 | `!help` | ✅ Complete | `src/commands.ts:91-106` |
-| 03.4 | `!remember` | ⚠️ Partial | Works on happy path but ignores guard rejection — see Critical issue |
-| 03.5 | `!forget` | ✅ Complete | `src/commands.ts:189-206` |
-| 03.6 | `!who` (JID + name search, ambiguity, truncation) | ✅ Complete | `src/commands.ts:208-275` |
-| 03.7 | `!status` | ✅ Complete | `src/commands.ts:277-282` |
-| 03.8 | `!silence` with `Nm/Nh/Nd` durations | ✅ Complete | `src/commands.ts:63-73,284-306` |
-| 03.9 | `!silence all` → global key `*` | ✅ Complete | `src/commands.ts:299` |
-| 03.10 | `!resume` | ✅ Complete | `src/commands.ts:308-311` |
-| 03.11 | Unknown command fallback | ✅ Complete | `src/commands.ts:350-352` |
-| 03.12 | Recursion guard: track outbound IDs for `msg.reply()` AND `chat.sendMessage()` | ✅ Complete | `src/index.ts:161-169` (command), `src/index.ts:310-317` (group reply) |
-| 03.13 | Bot replies never start with `!` | ⚠️ Partial | Dispatcher replies themselves don't, but `cmdWho` relays file contents — a memory file starting with `!` would produce a reply starting with `!`. ID-based guard still protects. |
-| 03.14 | Silence enforcement in handler | ✅ Complete | `src/index.ts:225-234` |
-| 03.15 | README Command Mode section | ✅ Complete | `README.md` (new section added) |
-| 03.16 | Dispatcher catches errors, replies with `error: <msg>` | ✅ Complete | `src/commands.ts:356-365` |
-
-**Compliance**: 14/16 fully met, 2 partial.
-
----
+**Compliance Score**: 26/26 requirements fully met
 
 ## Issues Found
 
 ### Critical (must fix before shipping)
 
-- **`src/memory-guard.ts:80-81`**: Shell injection surface. `execSync` is called with interpolated strings:
-  ```
-  execSync(`git add -f "${filePath}"`, ...)
-  execSync(`git commit -m "${subject}" -m "${body}"`, ...)
-  ```
-  `subject` is built from `cusJid` and `context.chatName`; `body` is built from `context.reason`. Today the call-sites pass only hardcoded strings (`'bootstrap'`, `'command !remember'`) and JIDs (which are practically safe), so this is not an *active* exploit — but it is one careless future caller away from being one. Any JID, reason, or chatName containing a double-quote, backtick, `$(...)`, or `;` escapes the quoted arg and executes shell. Use `execFileSync('git', ['add', '-f', filePath], ...)` and `execFileSync('git', ['commit', '-m', subject, '-m', body], ...)` — both completely eliminate the class of bug.
-
-- **`src/commands.ts:185-186`**: `!remember` lies about success. The call `await writeContactMemoryGuarded(...)` returns a `GuardResult` that is silently discarded, and the reply always says `ok, remembered: <fact> for <jid>`. If the guard rejects (e.g., the new content exceeds 8KB, or somehow loses the `## Identity` header), the file is not written but Nick is told it was. Fix: branch on `result.status` and reply `rejected: <reason>` on `'rejected'`, else confirm.
+- None
 
 ### Important (should fix)
 
-- **`src/index.ts:155` + `src/commands.ts:326`**: Duplicate `command.received` events. Both `index.ts` (before dispatch) and `commands.ts:dispatchCommand` emit `logEvent({ kind: 'command.received', ... })` for every command. Every command execution produces two `command.received` rows in `data/events.jsonl`, inflating stats (and potentially confusing future alerting). Pick one site — the dispatcher is the natural place since it runs for all entry points (including tests).
+- **`src/commands.ts:403`**: `!ambient status` reports memory count via `topicBank.length - cfg.explicitTopics.length - cfg.voiceProfileTopics.length`. This is incorrect whenever topics overlap across sources. Example: explicit=["tennis"], voice=["tennis","startups"], memory=[] → `topicBank=["tennis","startups"]` (size 2), formula yields `2 - 1 - 2 = -1`. The status line will show "memory: -1" to the user. Fix: compute `memoryTopics = loadMemoryTopics()` explicitly and report `memoryTopics.length` (pre-dedupe) or compute the post-dedupe memory contribution by tracking origins during the merge. No existing test caught this because `commands.test.ts:483-492` only asserts that master/cap/threshold keywords appear, not the arithmetic.
 
-- **`src/index.ts:230` vs `src/commands.ts:299`**: Silence key semantics are divergent and fragile. The command stores silences with the raw user arg (`"mgz"`) while the handler looks up `silences.has(chat.name)` where `chat.name` is WhatsApp's actual group name (often with emoji, casing differences, or trailing spaces). If the user types `!silence mgz 1h` but `chat.name === "MGZ"` or `"mgz "` or `"mgz 🏃"`, the silence never fires. At minimum: normalize both sides (lowercase + trim) before compare, or document the requirement to type the exact name. Preferably: also support partial match (`chat.name.toLowerCase().includes(key.toLowerCase())`).
-
-- **`src/memory-guard.ts:81`**: Commit-message injection via `chatName`. Even after fixing the shell injection (above), a chatName containing `"` or newline characters would still corrupt commit messages. Less severe but worth noting: when `execFileSync` is used, args are passed verbatim — a newline in the subject will land as a newline in the commit message. Consider stripping `\r\n` and trimming `chatName` / `reason` before using them in commit metadata.
-
-- **`tasks/main/implementation-notes.md` missing**: Task 01 explicitly asks the implementer to "document the choice in the task's Implementation Notes" for how `writeContactMemory` vs `writeContactMemoryGuarded` integration was handled. The file does not exist. The chosen approach (keep `writeContactMemory` as raw atomic write; bootstrap uses guarded path; runtime Edit tool bypasses guard entirely — covered by TODO at `src/index.ts:77-80`) is defensible, but it is not documented.
-
-- **`src/commands.test.ts`**: Missing coverage for `!silence` invalid duration path. `parseDuration` returns `null` for bad input and `cmdSilence` replies `"invalid duration. Examples: 30m, 2h, 1d"` — but no test exercises that branch. Similarly, no test for the dispatcher's outer `try/catch` reply-with-`error:`. Not blocking, but the adequacy bar for this task said "every command's happy path" — the negative paths matter here because they are user-facing.
+- **No `tasks/main/implementation-notes.md` exists**: The spec in both tasks required TDD mode and non-trivial architectural additions (new fuzzy module, config I/O, integration into index.ts). Implementation notes documenting decisions (e.g., dice vs Levenshtein, double `ensureDailyReset` call in `recordAmbientReply+index.ts`, why rate-limit runs after ambient gate instead of before) would help future reviewers/implementers calibrate. Not a blocker for this ship, but flag for future tasks.
 
 ### Minor (nice to fix)
 
-- **`src/index.ts:150`**: Gate condition uses `msg.fromMe` (truthy) instead of `msg.fromMe === true` as `src/extract.ts:11` does and as the task spec (§3.1) prescribes. whatsapp-web.js emits a proper boolean, so functionally identical, but the strict form matches the spec and the project's existing convention.
+- **`src/commands.ts:465-472`**: `!topic add <existing>` replies `ok, added ${phrase}` even when the phrase was already in the list. User-facing message is slightly misleading — something like `ok, ${phrase} already in list. total: N` would be more accurate. (Task 02 test #13 only asserts that duplicates are not added — not the reply wording.)
 
-- **`src/commands.ts:91-98` (HELP_TEXT)**: Defense-in-depth dent — `!help` reply includes "  !help" and similar lines as list items. After `.trim()` those don't start with `!`, so the handler's `startsWith('!')` gate doesn't re-fire on the round-trip. Safe in practice, but the task spec said "enforce this in the dispatcher — prefix every reply with `ok, ` or similar, never with `!`". Ambiguously worded but currently relying solely on the ID-based guard.
+- **`src/index.ts:369`**: `recordAmbientReply(ensureDailyReset(loadAmbientConfig()))` — `recordAmbientReply` itself calls `ensureDailyReset` internally (see `ambient.ts:224`), so the outer `ensureDailyReset` is redundant. Harmless but untidy.
 
-- **`src/commands.ts:208-275` (`cmdWho`)**: Returns raw file contents. If a memory file begins with `!` (e.g., "!!!important note..."), the round-tripped reply in the self-chat would start with `!` and be eligible for re-parsing as a command — recursion guard prevents this, but the file-prefix rule in the task spec implicitly assumed content would not start with `!`. Low probability in practice.
+- **`src/index.ts:266-276`**: The silence check fires AFTER the ambient gate. A chat muted via `!silence` will still trigger topic-bank build + `ambient.considered` event before being rejected at the silence check. For correctness this is fine (and matches spec intent — ambient is still gated by silence), but it means the `ambient.considered` event count in stats can over-count for muted chats. Consider moving the silence check before the ambient gate, or adding a pre-check to skip ambient when silenced.
 
-- **`src/memory-bootstrap.ts:236`**: Guard rejections share the `skippedClaudeEmpty` counter — the console summary will say `claude returned empty` when the actual reason was e.g. oversized or shrinkage. The structured event correctly says `guard_rejected: <reason>`, so stats are fine. Minor UX confusion in the live bootstrap log.
+- **`src/commands.ts:433-443`**: `!ambient refresh` reply is `ok, refreshed: voice=<n> memory=<m> total=<k>` — spec specified `ok, refreshed: voice=<n> memory=<m>`. The added `total=` is harmless but a small spec deviation.
 
-- **`src/stats.ts:332`**: Uses `require('path').join(...)` inside `main()` despite `path` not being imported at the top of the file. Works because of require semantics, but inconsistent with the ES-import style everywhere else.
+- **`src/prompts.test.ts`**: No test for `AMBIENT_PROMPT_PREFIX` or `VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT` — a simple smoke test that the `{VOICE_PROFILE}` placeholder fills without orphans would catch regressions if the template structure changes.
 
-- **`src/events.test.ts:100-113`**: The "survives missing parent dir" test comment concedes it cannot actually exercise the missing-dir case (because it shares `getEventsPath()` with the real project's `data/` dir). The test still passes but for an uninteresting reason — it only asserts `existsSync(path)` after calling `logEvent`. This leaves the `mkdirSync(..., { recursive: true })` behavior effectively untested.
+- **`src/commands.ts:111-122`**: `HELP_TEXT` constant lists new commands — good. But commands.test.ts:78-89 (`dispatchCommand — !help`) doesn't assert that `!ambient` or `!topic` appear, so a regression that drops them from help wouldn't be caught. Low-risk gap.
 
-- **`src/commands.ts:241`**: `readdirSync(dir).filter(f => f.endsWith('.md'))` — the task spec's name-search says "Grep `data/contacts/` for files matching the name (case-insensitive)". Current code does a case-insensitive *content* grep (`content.toLowerCase().includes(nameLC)`), not a filename match. This means `!who Alice` matches any file whose *contents* mention Alice (e.g., a group chat file that mentions her in facts). Probably intended, but worth confirming with the spec author — the spec's phrasing is ambiguous.
-
----
+- **`src/ambient.ts:282`**: `maybeRefreshVoiceProfileTopics` catches the `statSync` error with `catch {}` and returns `{ refreshed: false, count: 0 }` for any error (not just ENOENT). If permissions/IO fail for reasons other than "file missing", the user gets no warning. Consider differentiating ENOENT from other errors, matching the pattern in `loadMemoryTopics` (line 115).
 
 ## What Looks Good
 
-- **Module boundaries are clean.** `events.ts` is a tiny self-contained appender. `stats.ts` reads `events.jsonl` with no cross-dependencies on runtime state. `commands.ts` takes a `CommandContext` and stays offline from whatsapp-web.js entirely — tests use real fs and a stub `reply`, matching the "mocking discipline" guidance in the task spec.
-
-- **Atomic write pattern preserved.** `atomicWrite` in `memory-guard.ts:40-47` replicates the tmp+rename pattern from `memory.ts:40-46` rather than tangling the two. The file comment explicitly notes the non-circular design choice.
-
-- **Git-failure recovery is the right shape.** Any `execSync` throw caught, warning logged, status downgraded from `'committed'` to `'written'`, file write preserved. Bootstrap correctly handles all three statuses (`src/memory-bootstrap.ts:234-239`).
-
-- **Recursion guard wired at both reply sites.** Command replies via `chat.sendMessage` (`src/index.ts:161-169`) and group replies via `msg.reply` (`src/index.ts:310-317`) both add the returned message's `_serialized` ID to `recentOutboundIds`, with bounded eviction. The handler skips any inbound whose ID is in the set (`src/index.ts:132-136`).
-
-- **Structured logs are additive, not a replacement.** `console.log` for human-readable output remains (`src/index.ts:212,218,320`); `logEvent` runs alongside it. This matches the task brief's "Both go out" directive.
-
-- **Silence gate is placed correctly.** Block happens AFTER the rate-limit reservation but BEFORE the claude call — meaning silenced chats don't burn the rate-limit budget AND don't pay the claude cost (`src/index.ts:222,225-234`).
-
----
+- **Gate ordering**: `shouldAmbientReply` implements the 6 gates in exactly the documented order. Tests cover each failure branch (master, disabledGroups, cap, short, empty-bank, no-match) and the happy path.
+- **Default safety**: `masterEnabled: false` in `defaultAmbientConfig()` and persists from the shipped path. `loadAmbientConfig` returns defaults on both missing-file and malformed-JSON. Test coverage for both.
+- **Atomic writes**: `saveAmbientConfig` uses `tmp-<pid>-<ts>` + `renameSync`. Test `saveAmbientConfig atomic write` checks no `.tmp-` files remain.
+- **Chat-name normalization**: `normalizeChatKey` (`.trim().toLowerCase()`) used consistently in both `shouldAmbientReply` (comparing stored group key against incoming chat name) and all `!ambient on/off <chat>` command paths. `ambient.test.ts` covers the mixed-case case at line 259-268. `commands.test.ts` covers at test #4.
+- **Rate-limit and silence**: existing per-group 10s rate limit applies uniformly to ambient (reuses `lastReplyAt` map) — correct reuse of existing infrastructure.
+- **Ambient prompt prefix**: Prepended ONLY when trigger is `'ambient'`; `RUNTIME_PROMPT` structure is not modified. The prefix explicitly forbids "falando nisso" / "just saw this" and instructs Claude that empty output is the right answer most of the time.
+- **Trigger union extension**: Cleanly extended `'mention' | 'reply' | null` to `'mention' | 'reply' | 'ambient' | null` throughout the handler with no type-errors.
+- **Event kinds**: All 5 new event kinds added as pure union additions — no existing event code touched.
+- **Claude extraction via existing pattern**: `extractVoiceProfileTopics` uses the `_config.command` swap pattern from `claude.test.ts` for deterministic test output, avoiding real subprocess calls.
+- **Mtime-gated refresh**: `maybeRefreshVoiceProfileTopics` only re-runs claude when the voice profile's mtime changed, which avoids unnecessary API calls.
+- **Command structure**: `dispatchCommand` catches and logs errors uniformly; commands never throw out of the handler.
 
 ## Test Coverage
 
 | Area | Tests Exist | Coverage Notes |
-|---|---|---|
-| `memory-guard.ts` corruption rules | Yes | All 4 rules tested with both positive and negative cases |
-| `memory-guard.ts` git lifecycle | Yes | Happy path (committed), git-failure recovery, create vs update subjects |
-| `events.ts` | Yes | Append, timestamp, multi-write, IO error swallow |
-| `stats.ts` windowing | Yes | 24h / 7d / all cases; malformed line skipped |
-| `stats.ts` percentiles | Yes | Tolerant assertions on p50/p95/p99 |
-| `stats.ts` formatter | Partial | Only asserts headers + reply count, not the full template |
-| `commands.ts` parser | Yes | All edge cases from the spec |
-| `commands.ts` dispatcher (happy paths) | Yes | Every command has a happy-path test |
-| `commands.ts` dispatcher (error paths) | No | No test for `!silence <bad-duration>`, no test for command throwing → reply `error:` |
-| `commands.ts` silence enforcement in runtime | No | No handler-level test exists (acceptable — task spec didn't require it) |
-| Recursion guard | No | Not unit-tested; exercised only in integration |
+|------|-------------|----------------|
+| `fuzzy.normalize` | Yes | Lowercase, diacritics, punctuation, whitespace — all 4 spec cases covered |
+| `fuzzy.diceSimilarity` | Yes | Identical, disjoint, similar, case-insensitive |
+| `fuzzy.bestFuzzyMatch` | Yes | Top match, threshold respect, empty bank, empty body, fuzzy typo, threshold=0 |
+| `ambient.defaultAmbientConfig`/load/save | Yes | Defaults, malformed JSON, round-trip, atomic write |
+| `ambient.ensureDailyReset` | Yes | New day, same day |
+| `ambient.loadMemoryTopics` | Yes | Multi-file merge+dedupe, empty dir, files without section |
+| `ambient.buildTopicBank` | Yes | Merge, dedupe |
+| `ambient.shouldAmbientReply` | Yes | All 6 gate failures + happy path + chat normalization |
+| `ambient.recordAmbientReply` | Yes | Append timestamp, daily reset trigger |
+| `ambient.extractVoiceProfileTopics` | Yes | Parse, dedupe, cap 20, missing file, claude fails |
+| `!ambient on/off` | Yes | master flags, normalization |
+| `!ambient off <chat>` | Yes | Normalization, add/remove from disabledGroups |
+| `!ambient status` | Partial | Only asserts keywords — does NOT catch arithmetic bug |
+| `!ambient cap/threshold` | Yes | Valid + invalid input both tested |
+| `!ambient refresh` | No | No unit test for the sub-command (extractor itself is tested) |
+| `!topic add/remove/list` | Yes | Add, normalize, dedupe, remove missing, list all sources |
+| `AMBIENT_PROMPT_PREFIX` prepended on ambient trigger | No | No integration test; relies on visual code review |
+| Ambient path filters + emits correct events | No | No integration test; structural correctness verified by inspection |
+| Rate-limit applies to ambient | No | Not explicitly tested; relies on shared code path |
 
-**Test Coverage Assessment**: Strong on the data-layer modules (guard, events, stats). Commands have full happy-path coverage but lack two user-visible error branches. Recursion guard is untested but is a small amount of code with a clear invariant.
-
----
+**Test Coverage Assessment**: Core pure-logic modules (fuzzy, ambient gate, config I/O, memory parsing, extractor) are thoroughly tested. Command handlers well covered. Runtime integration tests are absent — acceptable given `src/index.ts` has never had a full integration test (the existing `index.test.ts` only covers pure helpers), but the ambient-specific event emissions and rate-limit/ambient interplay would benefit from at least one integration test in the future.
 
 ## Test Execution
 
 | Check | Result | Details |
-|---|---|---|
-| Test command discovered | Yes (`npm test` → `vitest run`) | `package.json:11` |
-| Test suite run | Passed (134/134, 10 files) | 790ms; no skipped, no warnings |
-| Build check | Passed (`tsc` exit 0) | `package.json:10` |
-| TDD evidence in implementation notes | N/A | `tasks/main/implementation-notes.md` does not exist — see Important issue |
+|-------|--------|---------|
+| Test command discovered | Yes (`npm test` → `vitest run`) | From `package.json:11` |
+| Test suite run | Passed (196/196) | 12 test files pass; pre-existing puppeteer `Unhandled Rejection` from `index.test.ts` running full main() is unrelated to this change |
+| TDD evidence in implementation notes | N/A | `implementation-notes.md` is absent; the code structure + test-first names (e.g., numbered test comments matching spec) indicate TDD was likely followed |
 
-**Test Execution Assessment**: Clean green run. Test count grew from 76 baseline → 134, a +58 increase consistent with the new modules. Build is green.
-
----
+**Test Execution Assessment**: All 196 tests pass. Build is clean. The pre-existing unhandled puppeteer rejection is unrelated to the ambient feature (it's from `index.test.ts` importing `./index` which has a side effect of `main().catch(...)` at module top-level — this predates this batch of changes).
 
 ## TDD Compliance
 
 | Task | Tests Written | Tests Adequate | TDD Skipped Reason Valid | Notes |
-|---|---|---|---|---|
-| 01 — Memory Guard | Yes | Yes | N/A | All 13 specified test behaviors present. Git-verification goes through real `execSync` on a real temp repo as the spec directed. |
-| 02 — Events + Stats | Yes | Yes | N/A | 5 events tests + 13 stats tests. Window filter and percentile tests use explicit ISO timestamps (spec-compliant), no Date mocking. |
-| 03 — Commands | Yes | Mostly | N/A | Parser tests are complete; dispatcher happy paths covered; error branches (bad duration, thrown error) not covered. |
+|------|---------------|---------------|-------------------------|-------|
+| task-01-ambient-infra | Yes | Yes | N/A | All 13 fuzzy cases + all 18 ambient cases from spec present |
+| task-02-ambient-integration | Yes | Yes | N/A | All 16 command cases + 5 extractor cases present |
 
-**TDD Assessment**: Tests are genuine specifications — they call real code, use real fs with temp dirs, and assert on specific values (commit message strings, reply content, file contents). No trivial `toBeDefined()` assertions. Mocking discipline is good (stub `reply` for commands, real git for guard, no fs mocks).
+**TDD Assessment**: Tests map tightly to spec-enumerated test cases (numbered 1–18 for ambient, 1–16 for commands, 17–21 for extractor). Tests call real code, real fs, real dice scorer; mocking is kept at the system boundary (the claude subprocess via `_config.command`), which matches this project's conventions.
 
-**Test Adequacy**: ~44 new test cases; ~42 are meaningful and specific. The 2 weak ones: (a) `events.test.ts:100-113` "survives missing parent dir" admits in a comment that it can't actually exercise the delete-data-dir case; (b) `stats.test.ts:173-181` `formatStats` "shows reply count" only asserts the output contains the string `'2'` — a formatter regression that printed a totally different number format could pass this test.
+**Test Adequacy**: 42/44 tests are meaningful and specific. 2 tests flagged as weak:
+- `commands.test.ts:484-492` (`!ambient status`) only asserts that `master`/`cap`/`threshold` substrings appear. Does not check the `memory:` count is non-negative or numerically correct — this is how the arithmetic bug at `commands.ts:403` slipped through.
+- `commands.test.ts:78-89` (`!help`) does not assert `!ambient` or `!topic` appear — a regression that drops them from help would not be caught.
 
----
-
-## Implementation Decision Review
-
-| Task | Decisions Documented | Decisions Sound | Flags |
-|---|---|---|---|
-| 01 | No (file missing) | Yes | `writeContactMemory` kept raw, bootstrap uses guarded path, runtime Edit tool bypasses guard with a TODO — defensible but undocumented |
-| 02 | No (file missing) | Yes | Additive logging pattern implemented cleanly |
-| 03 | No (file missing) | Mostly | Silence key uses raw user input without normalization — a decision that should be flagged |
-
-**Decision Assessment**: The architectural decisions made appear sound, but the absence of `tasks/main/implementation-notes.md` means reviewers have to reverse-engineer intent from code and commit history. Task 01 explicitly asked for this file. Create it before committing.
-
----
+Other tests use real assertions with specific expected values (`toBe`, `toEqual`, `toContain`, numeric comparisons). Mocking discipline is correct: only `_config.command` (system boundary) is swapped in extractor tests; no internal modules are mocked.
 
 ## Plan Review
 
 ### Dependency Graph
 
 | Task | Depends On | Status |
-|---|---|---|
-| task-01 | None | ✅ Valid |
-| task-02 | None | ✅ Valid |
-| task-03 | task-02 (for `events.ts`) | ✅ Valid — task-02 is indeed merged alongside |
+|------|-----------|--------|
+| task-01-ambient-infra | None | Valid |
+| task-02-ambient-integration | task-01 | Valid |
 
-**Dependency Assessment**: No issues found. Task 03 correctly declares its dependency on task 02 for the events module (used by `!status`).
+**Dependency Assessment**: No issues found. Task 02 correctly declares dependency on Task 01 (it needs the exports from `src/ambient.ts`, `src/fuzzy.ts`, and the new prompt + event additions). No circular deps; no phantom refs.
 
 ### PRD Coverage
 
-The PRD here is `docs/architecture-improvements.md` items 1, 2, 4, 5.
+| PRD Requirement | Covered By | Status |
+|----------------|-----------|--------|
+| Fuzzy match (threshold, not substring) | task-01 + implementation | Covered |
+| Hybrid topic source (explicit + voice + memory) | task-01 | Covered |
+| Daily cap (default 30, adjustable via !ambient cap) | task-01 + task-02 | Covered |
+| Per-group rate limit still applies (reuse lastReplyAt) | task-02 | Covered |
+| No hardcoded reply prefix (voice profile governs) | task-01 (AMBIENT_PROMPT_PREFIX) | Covered |
+| `!ambient on` = global, `!ambient off <chat>` = blocklist | task-02 | Covered |
+| Off by default | task-01 (defaultAmbientConfig) | Covered |
+| `!ambient refresh` rebuilds voice + memory | task-02 | Covered |
+| `!topic` add/remove/list | task-02 | Covered |
+| Ambient uses AMBIENT_PROMPT_PREFIX + RUNTIME_PROMPT | task-02 | Covered |
+| `ambient.skipped`/`considered`/`replied`/`declined` events | task-01 (enum) + task-02 (wiring) | Covered |
+| README updated with ambient section | task-02 | Covered |
 
-| PRD Item | Covered By | Status |
-|---|---|---|
-| Item 1: Git-version memory files | task-01 | ✅ Covered |
-| Item 2: Corruption guard on Edit | task-01 | ✅ Covered |
-| Item 4: Structured logs + `npm run stats` | task-02 | ✅ Covered |
-| Item 5: Command-mode self-chat | task-03 | ✅ Covered |
-| Item 4 sub-req: token/cost extraction | task-02 (deferred) | ⚠️ Stubbed — fields always undefined; task-02 §3 notes this is intentional for now |
-| Item 5 sub-req: `!bootstrap` command | Not in v1 scope | ⚠️ task-03 dropped this command (spec §3 omitted it) |
-| Item 5 sub-req: `!voice refresh` command | Not in v1 scope | ⚠️ task-03 dropped this command |
-
-**Coverage Score**: 4/4 headline items covered; 2 sub-commands from item 5 were deliberately dropped from v1 scope (consistent with task-03's stated command list).
+**Coverage Score**: 12/12 requirements covered
 
 ### File Conflict Analysis
 
 | File | Tasks Touching It | Conflict? |
-|---|---|---|
-| `src/index.ts` | task-02 (events) + task-03 (self-chat gate + silence) | ⚠️ Concurrent writes — but task-03 depends on task-02, so ordered. Final file combines both cleanly. |
-| `src/memory-bootstrap.ts` | task-01 (guarded write) + task-02 (events) | ⚠️ Concurrent writes, no declared dependency. Final file merges both, but this could have been a merge conflict. |
-| `src/memory.ts` | task-01 only | ✅ No conflict |
-| `.gitignore` | task-02 only | ✅ No conflict |
-| `package.json` | task-02 only | ✅ No conflict |
-| `README.md` | task-03 only | ✅ No conflict |
+|------|------------------|-----------|
+| `src/fuzzy.ts` | task-01 | No conflict (new file, single task) |
+| `src/ambient.ts` | task-01, task-02 | Ordered (task-02 depends on task-01) |
+| `src/ambient.test.ts` | task-01, task-02 | Ordered (task-02 appends extractor tests) |
+| `src/prompts.ts` | task-01 | No conflict (single task adds exports) |
+| `src/events.ts` | task-01 | No conflict (single task adds enum values) |
+| `src/commands.ts` | task-02 | No conflict |
+| `src/commands.test.ts` | task-02 | No conflict |
+| `src/index.ts` | task-02 | No conflict |
+| `README.md` | task-02 | No conflict |
+| `.gitignore` | task-01 | No conflict |
 
-**Conflict Assessment**: `src/memory-bootstrap.ts` is modified by both task-01 (change writeContactMemory → writeContactMemoryGuarded) and task-02 (add logEvent calls). Task files do not declare this. In practice the changes are orthogonal (different lines) and the merged result is coherent, but if these tasks had been implemented by different agents in parallel they could have race-conflicted.
+**Conflict Assessment**: No conflicts detected.
 
 ### Task Sizing
 
 | Task | Assessment | Notes |
-|---|---|---|
-| task-01 | ✅ Well-sized | One coherent module (+ test) + 1 integration point |
-| task-02 | ✅ Well-sized | Two modules (events + stats) + instrumentation at known sites |
-| task-03 | ⚠️ Slightly oversized | Command parser + 7 commands + runtime gate + recursion guard + README. Acceptable because commands are small and similar, but this is the biggest task and the one with the most partial-completion risk. |
+|------|-----------|-------|
+| task-01-ambient-infra | Well-sized | 5 files, clear scope (pure-logic foundation), self-contained |
+| task-02-ambient-integration | Well-sized | 6 files, builds on task-01, scope is runtime wiring + commands + README |
 
 ### TDD Spec Consistency
 
 | Task | Has TDD Section | Framework Valid | Command Valid | Status |
-|---|---|---|---|---|
-| task-01 | Yes | Yes (Vitest — matches repo) | Yes (`npm test` → `vitest run`) | ✅ |
-| task-02 | Yes | Yes | Yes | ✅ |
-| task-03 | Yes | Yes | Yes | ✅ |
+|------|----------------|-----------------|--------------|--------|
+| task-01-ambient-infra | Yes | Yes (Vitest) | Yes (`npm test`) | OK |
+| task-02-ambient-integration | Yes | Yes (Vitest) | Yes (`npm test`) | OK |
 
-**TDD Spec Assessment**: All three task files specify Vitest and reference the `npm test` command — both real and consistent with the repo.
+**TDD Spec Assessment**: Both tasks reference Vitest (correct — used throughout repo) and `npm test` (correct — matches package.json). Test file paths (`src/fuzzy.test.ts`, `src/ambient.test.ts`, `src/commands.test.ts`) follow the project's colocation convention.
 
 ### Plan Issues Found
 
@@ -261,23 +199,24 @@ The PRD here is `docs/architecture-improvements.md` items 1, 2, 4, 5.
 - None
 
 #### Important (should fix before proceeding)
-- `src/memory-bootstrap.ts` is modified by both task-01 and task-02 without a declared dependency. No actual conflict occurred this round but this is the kind of implicit coupling that bites parallel execution. Either task-02 should declare an ordering dependency on task-01, or the task files should explicitly call out the shared file and split instrumentation into a deferred follow-up.
+- None
 
 #### Minor (nice to fix)
-- `tasks/main/implementation-notes.md` is missing. Task 01 explicitly asks for it. Create it before closing this batch.
-- Task-03 command set dropped `!bootstrap` and `!voice refresh` from the PRD's list. Intentional and reasonable for v1, but the deviation is not called out in the task file — a future reviewer may flag it as a gap.
+- None
 
----
+## Implementation Decision Review
+
+| Task | Decisions Documented | Decisions Sound | Flags |
+|------|---------------------|----------------|-------|
+| task-01-ambient-infra | No (no implementation-notes.md) | Yes (from code) | None |
+| task-02-ambient-integration | No (no implementation-notes.md) | Yes (from code) | None |
+
+**Decision Assessment**: No `implementation-notes.md` exists — the implementer did not document reasoning. Based on code inspection, decisions look sound: dice bigram is a standard choice for fuzzy matching, `_config.command` swap for extractor tests matches the existing project convention, mtime-gated voice profile refresh avoids unnecessary claude calls, and the trigger union was extended rather than overloaded. The one arithmetic bug in `!ambient status` (memory count via subtraction) suggests the implementer did not test manually after shipping — a quick `!ambient status` run would have surfaced the negative count.
 
 ## Recommendations
 
-Ordered by priority:
-
-1. **Fix the shell injection.** Replace both `execSync` calls in `src/memory-guard.ts:80-81` with `execFileSync('git', [...])` passing args as an array. Low-effort, defensive, closes a real class of bug.
-2. **Fix `!remember` false confirmation.** `src/commands.ts:185-186` should branch on `result.status` and reply `rejected: <reason>` on `'rejected'`.
-3. **De-duplicate `command.received` events.** Remove the call at `src/index.ts:155` and keep only the one in `src/commands.ts:326` (dispatcher-side is canonical).
-4. **Normalize silence keys.** At minimum, lowercase + trim both sides of the `silences.has(chat.name)` compare. Ideally, support substring match so `!silence mgz` matches `"MGZ 🏃"`.
-5. **Write `tasks/main/implementation-notes.md`.** Document: (a) why `writeContactMemory` was kept raw and `writeContactMemoryGuarded` added as a second export rather than routing through the guard unconditionally; (b) the runtime-Edit-tool-bypass TODO and how a future task would close it; (c) the silence-key normalization decision (current: none); (d) the duplicate-command.received decision (after fix).
-6. **Add negative-path tests** for `!silence <bad-duration>` and for the dispatcher's outer catch → `error:` reply.
-7. **Harden commit metadata.** Even after fix (1), strip newlines and quotes from `chatName` / `reason` before using them in commit subjects/bodies.
-8. **Minor cleanups.** Strict `=== true` in `src/index.ts:150`; import `path` at top of `src/stats.ts` instead of in-line `require`.
+1. **Fix the `!ambient status` memory count arithmetic** (`src/commands.ts:403`). Use `loadMemoryTopics().length` directly instead of subtracting from the deduped bank. Add a test that asserts the count is non-negative with overlapping sources.
+2. **Improve `!topic add` duplicate reply wording** so users know when a phrase was already present.
+3. **Remove the redundant `ensureDailyReset` call** in `src/index.ts:369` (the wrapped `recordAmbientReply` already does it).
+4. **Optionally**: add a smoke test for `AMBIENT_PROMPT_PREFIX` in `prompts.test.ts`, and assert that `!ambient`/`!topic` appear in `!help` output in `commands.test.ts`.
+5. **Future**: add an `implementation-notes.md` for this batch documenting why dice bigram (vs Levenshtein) was chosen, why `_config.command` swap is used for extractor tests, and the design choice of running the silence gate after the ambient gate rather than before.

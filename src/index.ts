@@ -9,10 +9,20 @@ import {
   formatMessageLine,
 } from './whatsapp';
 import { callClaudeWithTools } from './claude';
-import { RUNTIME_PROMPT, fillTemplate } from './prompts';
+import { RUNTIME_PROMPT, AMBIENT_PROMPT_PREFIX, fillTemplate } from './prompts';
 import { resolveToCus } from './memory';
 import { logEvent } from './events';
 import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
+import {
+  loadAmbientConfig,
+  saveAmbientConfig,
+  ensureDailyReset,
+  buildTopicBank,
+  loadMemoryTopics,
+  shouldAmbientReply,
+  recordAmbientReply,
+  type AmbientDecision,
+} from './ambient';
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
@@ -191,7 +201,7 @@ async function main(): Promise<void> {
       dbg(`msg in [${chat.name}]: body="${(msg.body || '').slice(0, 60)}" mentionedIds=${JSON.stringify(msg.mentionedIds)} hasQuoted=${msg.hasQuotedMsg}`);
 
       // Gate 3: we must be mentioned OR they must be replying to one of our messages
-      let trigger: 'mention' | 'reply' | null = null;
+      let trigger: 'mention' | 'reply' | 'ambient' | null = null;
       if (isMentioned(msg.mentionedIds, ownerIds)) {
         trigger = 'mention';
       } else if (msg.hasQuotedMsg) {
@@ -202,25 +212,10 @@ async function main(): Promise<void> {
           dbg(`getQuotedMessage failed: ${(e as Error).message}`);
         }
       }
-      if (!trigger) {
-        dbg(`skip: not mentioned, not a reply to us (owners=${JSON.stringify(ownerIds)})`);
-        logEvent({ kind: 'skip.not_mentioned', chat: chat.name, chat_id: chat.id?._serialized });
-        return;
-      }
-
-      console.log(`[${trigger}] [${chat.name}] ${msg.body?.slice(0, 80) ?? ''}`);
-
-      // Gate 4: rate limit (10s per group)
+      // Silence check: global mute ("*") or per-chat mute.
+      // Runs BEFORE the ambient gate so silenced chats never reach topic-bank
+      // fuzzy matching, regardless of whether there is a mention/reply trigger.
       const groupJid = chat.id._serialized;
-      const nowMs = Date.now();
-      if (isRateLimited(lastReplyAt, groupJid, nowMs, RATE_LIMIT_MS)) {
-        console.log(`[${trigger}] skipped: rate-limited in [${chat.name}]`);
-        logEvent({ kind: 'skip.rate_limited', chat: chat.name, chat_id: groupJid, trigger });
-        return;
-      }
-      recordReply(lastReplyAt, groupJid, nowMs);
-
-      // Silence check: global mute ("*") or per-chat mute
       if (silences.has('*') && silences.get('*')! > Date.now()) {
         dbg(`skip: globally silenced`);
         logEvent({ kind: 'skip.silenced', reason: 'global', chat: chat.name, chat_id: groupJid });
@@ -231,6 +226,56 @@ async function main(): Promise<void> {
         logEvent({ kind: 'skip.silenced', reason: 'per-chat', chat: chat.name, chat_id: groupJid });
         return;
       }
+
+      if (!trigger) {
+        // No mention, no reply-to-Nick. Try ambient.
+        let ambientDecision: AmbientDecision | null = null;
+        try {
+          const cfg = ensureDailyReset(loadAmbientConfig());
+          const topicBank = buildTopicBank(cfg, loadMemoryTopics());
+          ambientDecision = shouldAmbientReply({
+            cfg,
+            chatName: chat.name,
+            messageBody: msg.body || '',
+            topicBank,
+          });
+        } catch (e) {
+          dbg(`ambient gate threw: ${(e as Error).message}`);
+        }
+
+        if (!ambientDecision || !ambientDecision.pass) {
+          dbg(`ambient skip: ${ambientDecision?.reason ?? 'gate error'}`);
+          logEvent({
+            kind: 'ambient.skipped',
+            chat: chat.name,
+            chat_id: chat.id._serialized,
+            reason: ambientDecision?.reason ?? 'gate error',
+          });
+          return;
+        }
+
+        // Ambient triggered
+        trigger = 'ambient';
+        dbg(`ambient triggered: matchedTopic=${ambientDecision.matchedTopic} score=${ambientDecision.score}`);
+        logEvent({
+          kind: 'ambient.considered',
+          chat: chat.name,
+          chat_id: chat.id._serialized,
+          matchedTopic: ambientDecision.matchedTopic,
+          score: ambientDecision.score,
+        });
+      }
+
+      console.log(`[${trigger}] [${chat.name}] ${msg.body?.slice(0, 80) ?? ''}`);
+
+      // Gate 4: rate limit (10s per group)
+      const nowMs = Date.now();
+      if (isRateLimited(lastReplyAt, groupJid, nowMs, RATE_LIMIT_MS)) {
+        console.log(`[${trigger}] skipped: rate-limited in [${chat.name}]`);
+        logEvent({ kind: 'skip.rate_limited', chat: chat.name, chat_id: groupJid, trigger });
+        return;
+      }
+      recordReply(lastReplyAt, groupJid, nowMs);
 
       // Fetch BEFORE context: last 11 messages, exclude the mention itself
       const beforeFetch = await chat.fetchMessages({ limit: 11 });
@@ -285,13 +330,19 @@ async function main(): Promise<void> {
       };
       dbg(`handing off to claude w/ tools; sender=${vars.SENDER_JID}`);
 
+      const promptTemplate =
+        trigger === 'ambient' ? AMBIENT_PROMPT_PREFIX + RUNTIME_PROMPT : RUNTIME_PROMPT;
       const callStart = Date.now();
-      const response = await callClaudeWithTools(fillTemplate(RUNTIME_PROMPT, vars));
+      const response = await callClaudeWithTools(fillTemplate(promptTemplate, vars));
       const callDurationMs = Date.now() - callStart;
       const reply = response.trim();
 
       // Silence is allowed — if Claude returns empty, skip
       if (!reply) {
+        if (trigger === 'ambient') {
+          logEvent({ kind: 'ambient.declined', chat: chat.name, chat_id: groupJid });
+          return;
+        }
         logEvent({
           kind: 'reply.silent',
           chat: chat.name,
@@ -313,6 +364,13 @@ async function main(): Promise<void> {
           const first = recentOutboundIds.values().next().value;
           if (first !== undefined) recentOutboundIds.delete(first);
         }
+      }
+
+      // If ambient triggered, record the reply in the daily counter
+      if (trigger === 'ambient') {
+        const cfgAfter = recordAmbientReply(ensureDailyReset(loadAmbientConfig()));
+        saveAmbientConfig(cfgAfter);
+        logEvent({ kind: 'ambient.replied', chat: chat.name, trigger: 'ambient' });
       }
 
       // Log the handled mention

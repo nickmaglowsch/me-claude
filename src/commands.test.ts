@@ -397,3 +397,237 @@ describe('dispatchCommand — !resume', () => {
     expect(replies[0]).toContain('resumed');
   });
 });
+
+// ---- !ambient + !topic tests ------------------------------------------------
+// These commands read/write ambient-config.json in data/, so we need a tmp cwd.
+
+describe('dispatchCommand — !ambient and !topic', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'commands-ambient-test-'));
+    fs.mkdirSync(path.join(tmpDir, 'data', 'contacts'), { recursive: true });
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // Helper to read the persisted config
+  function loadCfg() {
+    const cfgPath = path.join(tmpDir, 'data', 'ambient-config.json');
+    return JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  }
+
+  // Test 1: !ambient on — sets masterEnabled=true, persists, reply mentions "on"
+  it('!ambient on sets masterEnabled=true and confirms', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient on')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.masterEnabled).toBe(true);
+    expect(replies[0]).toMatch(/on/i);
+    expect(replies[0]).toMatch(/ambient/i);
+  });
+
+  // Test 2: !ambient off — sets masterEnabled=false
+  it('!ambient off sets masterEnabled=false and confirms', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient off')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.masterEnabled).toBe(false);
+    expect(replies[0]).toMatch(/off/i);
+  });
+
+  // Test 3: !ambient off mgz — adds "mgz" to disabledGroups
+  it('!ambient off <chat> adds chat to disabledGroups', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient off mgz')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.disabledGroups).toContain('mgz');
+    expect(replies[0]).toMatch(/disabled/i);
+    expect(replies[0]).toContain('mgz');
+  });
+
+  // Test 4: !ambient off MGZ — normalizes to "mgz"
+  it('!ambient off <CHAT> normalizes chat name to lowercase', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient off MGZ')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.disabledGroups).toContain('mgz');
+    expect(cfg.disabledGroups).not.toContain('MGZ');
+  });
+
+  // Test 5: !ambient on mgz — removes from disabledGroups
+  it('!ambient on <chat> removes chat from disabledGroups', async () => {
+    // First disable it
+    const replies1: string[] = [];
+    await dispatchCommand(parseCommand('!ambient off mgz')!, makeCtx(replies1, new Map()));
+    // Then re-enable it
+    const replies2: string[] = [];
+    const ctx = makeCtx(replies2, new Map());
+    await dispatchCommand(parseCommand('!ambient on mgz')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.disabledGroups).not.toContain('mgz');
+    expect(replies2[0]).toMatch(/re-enabled|enabled/i);
+    expect(replies2[0]).toContain('mgz');
+  });
+
+  // Test 6: !ambient status — includes master state, topic count, cap, threshold
+  it('!ambient status includes master state, cap, threshold, and non-negative topic counts', async () => {
+    // Add an explicit topic and a voice topic that overlap to verify arithmetic is correct
+    await dispatchCommand(parseCommand('!topic add tennis')!, makeCtx([], new Map()));
+    // Simulate overlapping voice topic by writing config directly
+    const cfgPath = path.join(tmpDir, 'data', 'ambient-config.json');
+    const existing = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    fs.writeFileSync(cfgPath, JSON.stringify({ ...existing, voiceProfileTopics: ['tennis', 'startups'] }), 'utf8');
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient status')!, ctx);
+    const text = replies[0];
+    expect(text).toMatch(/master/i);
+    expect(text).toMatch(/cap/i);
+    expect(text).toMatch(/threshold/i);
+    // New format: "topics: explicit=N voice=N memory=N bank=N"
+    expect(text).toMatch(/topics:/i);
+    expect(text).toMatch(/explicit=\d+/);
+    expect(text).toMatch(/voice=\d+/);
+    expect(text).toMatch(/memory=\d+/);
+    expect(text).toMatch(/bank=\d+/);
+    // With explicit=["tennis"] and voice=["tennis","startups"], bank dedupes to 2.
+    // The old formula would yield 2 - 1 - 2 = -1; the new one should give memory=0.
+    expect(text).toContain('explicit=1');
+    expect(text).toContain('voice=2');
+    expect(text).toContain('memory=0');
+    expect(text).toContain('bank=2');
+  });
+
+  // Test 7: !ambient cap 50 — sets dailyCap
+  it('!ambient cap <n> sets dailyCap', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient cap 50')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.dailyCap).toBe(50);
+    expect(replies[0]).toMatch(/50/);
+    expect(replies[0]).toMatch(/cap/i);
+  });
+
+  // Test 8: !ambient cap abc — validation error; cap unchanged
+  it('!ambient cap <non-int> replies with validation error and leaves cap unchanged', async () => {
+    // Set a known cap first
+    await dispatchCommand(parseCommand('!ambient cap 42')!, makeCtx([], new Map()));
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient cap abc')!, ctx);
+    expect(replies[0]).toMatch(/invalid|error|positive/i);
+    const cfg = loadCfg();
+    expect(cfg.dailyCap).toBe(42);
+  });
+
+  // Test 9: !ambient threshold 0.7 — sets confidenceThreshold
+  it('!ambient threshold <n> sets confidenceThreshold', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient threshold 0.7')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.confidenceThreshold).toBeCloseTo(0.7);
+    expect(replies[0]).toMatch(/threshold/i);
+    expect(replies[0]).toMatch(/0\.7/);
+  });
+
+  // Test 10: !ambient threshold 2 — validation error (out of 0-1 range)
+  it('!ambient threshold <out-of-range> replies with validation error', async () => {
+    // First establish a known config with a valid threshold (0.5 = default)
+    await dispatchCommand(parseCommand('!ambient threshold 0.5')!, makeCtx([], new Map()));
+    // Now attempt an invalid one
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!ambient threshold 2')!, ctx);
+    expect(replies[0]).toMatch(/invalid|error|range|0.*1/i);
+    const cfg = loadCfg();
+    // Unchanged from the valid one set above
+    expect(cfg.confidenceThreshold).toBeCloseTo(0.5);
+  });
+
+  // Test 11: !topic add tennis — appends to explicitTopics
+  it('!topic add <phrase> appends to explicitTopics', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add tennis')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.explicitTopics).toContain('tennis');
+    expect(replies[0]).toMatch(/added/i);
+    expect(replies[0]).toContain('tennis');
+  });
+
+  // Test 12: !topic add TENNIS — normalizes to "tennis"
+  it('!topic add <PHRASE> normalizes to lowercase', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add TENNIS')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.explicitTopics).toContain('tennis');
+    expect(cfg.explicitTopics).not.toContain('TENNIS');
+  });
+
+  // Test 13: !topic add tennis (second time) — no duplicate, reply says "already in list"
+  it('!topic add duplicate phrase does not add it twice and replies "already in list"', async () => {
+    await dispatchCommand(parseCommand('!topic add tennis')!, makeCtx([], new Map()));
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add tennis')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.explicitTopics.filter((t: string) => t === 'tennis')).toHaveLength(1);
+    expect(replies[0]).toMatch(/already in list/i);
+    expect(replies[0]).toContain('tennis');
+  });
+
+  // Test 14: !topic remove tennis — removes from list
+  it('!topic remove <phrase> removes from explicitTopics', async () => {
+    await dispatchCommand(parseCommand('!topic add tennis')!, makeCtx([], new Map()));
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic remove tennis')!, ctx);
+    const cfg = loadCfg();
+    expect(cfg.explicitTopics).not.toContain('tennis');
+    expect(replies[0]).toMatch(/removed/i);
+  });
+
+  // Test 15: !topic remove nonexistent — reply indicates not found
+  it('!topic remove <nonexistent> replies with not found message', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic remove ghost')!, ctx);
+    expect(replies[0]).toMatch(/not in list|not found/i);
+  });
+
+  // Test 16: !topic list — replies with all 3 sources
+  it('!topic list replies with all 3 topic sources', async () => {
+    // Add an explicit topic
+    await dispatchCommand(parseCommand('!topic add crypto')!, makeCtx([], new Map()));
+    // Add a contact file with a recurring topic
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'contacts', 'alice@c.us.md'),
+      `# Alice\n\n## Recurring topics\n- startups\n`,
+      'utf8',
+    );
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic list')!, ctx);
+    const text = replies[0];
+    expect(text).toMatch(/explicit/i);
+    expect(text).toContain('crypto');
+    expect(text).toMatch(/memory/i);
+    expect(text).toContain('startups');
+  });
+});

@@ -1,65 +1,68 @@
-# Shared Context for Improvements Batch 1
+# Shared Context for Ambient Replies Feature
 
-## Project State (as of 2026-04-18)
+## What's being built
 
-WhatsApp voice-mimicking bot with per-contact memory. Already shipped:
-- Voice profile in `data/voice_profile.md`
-- Per-contact memory in `data/contacts/<jid>@c.us.md`
-- Runtime uses `claude -p` with tool access (Read/Edit/Write/Grep/Glob)
-- Self-chat detection works (chat.id === ownerCusId)
+Add an "ambient reply" path so the bot can chime in on plain group messages
+(no mention, no reply-to-Nick) when they're about Nick or topics he cares about.
+Togglable via `!` commands. Off by default for all groups; once enabled
+globally, applies to every group Nick is in unless a specific group is
+explicitly disabled.
 
-## Key files
+## Feature decisions (from 2026-04-18)
 
-| File | Role |
-|---|---|
-| `src/index.ts` | Runtime entry, message_create handler, rate limit |
-| `src/setup.ts` | One-shot voice profile generation |
-| `src/memory.ts` | readContactMemory, writeContactMemory, resolveToCus |
-| `src/memory-bootstrap.ts` | Seed memory files from chat history |
-| `src/whatsapp.ts` | Client setup, helpers |
-| `src/claude.ts` | callClaude (no tools) + callClaudeWithTools |
-| `src/prompts.ts` | RUNTIME_PROMPT, META_PROMPT, MEMORY_UPDATE_PROMPT, BOOTSTRAP_PROMPT, fillTemplate |
-| `src/extract.ts` | Message filtering + stratified sampling |
-| `data/voice_profile.md` | Voice profile (gitignored) |
-| `data/contacts/*.md` | Per-contact memory files (gitignored) |
+1. **Topic source**: hybrid — explicit list (managed via `!topic`) + auto-extract
+   from voice profile + aggregated `## Recurring topics` sections from all
+   `data/contacts/*.md` files.
+2. **Daily cap**: default 30 ambient replies per day, adjustable via `!ambient cap <n>`.
+3. **Per-group rate limit**: not added. Existing 10s-per-group rate limit
+   (from the mention path) still applies since it reuses `lastReplyAt`.
+4. **Opening style**: let voice profile govern. No hardcoded prefix.
+5. **Scope**: `!ambient on` enables globally. `!ambient off <chat>` disables
+   a specific group. `!ambient off` with no arg disables globally (master kill).
+6. **Topic matching**: fuzzy match with confidence threshold, not substring.
 
-## Conventions
+## Pipeline
 
-- **TypeScript CommonJS.** No ESM, no `"type": "module"`. Imports compile to CJS.
-- **Vitest**, tests co-located as `*.test.ts`.
-- **tsx** runs source directly for dev. `tsc` compiles to `dist/`.
-- **Single-brace `{KEY}` placeholders** in prompt templates. Use `fillTemplate` from `src/prompts.ts`.
-- **No emojis in code or output** unless user explicitly requests.
-- **Atomic file writes**: write tmp + rename. See `writeContactMemory` in `src/memory.ts` for the pattern.
-- **Dotenv at entry points.** `import 'dotenv/config'` as the first line.
-
-## Build/test commands
-
-```bash
-npm run build    # tsc → dist/
-npm test         # vitest run
-npm start        # runtime bot
-npm run setup    # build voice profile
-npm run memory:bootstrap  # seed memory files
+```
+message_create, plain group message (not mention, not reply-to-Nick, not fromMe):
+  └─ ambient config: masterEnabled? NO → skip
+  └─ chat.name in disabledGroups? YES → skip
+  └─ daily cap exceeded? YES → skip
+  └─ fuzzy match body against topicBank
+     (explicit + voice-profile-topics + memory-recurring-topics)
+  └─ best fuzzy score < threshold → skip
+  └─ call claude with AMBIENT-flavored RUNTIME_PROMPT
+     (strongly prefers silence; only outputs when genuinely worth chiming in)
+  └─ empty response → skip, log as "declined by model"
+  └─ non-empty → send reply, record in repliesToday, log
 ```
 
-## Current test count
-76 tests across 6 files. All green. New tests must not break existing ones.
+## Design note: single claude call, not separate classifier
 
-## Owner IDs at runtime
+The original sketch had 2 claude calls: classifier + reply. The shipped
+version uses ONE call with an AMBIENT-flavored prompt prefix that strongly
+biases toward silence. Claude's existing RUNTIME_PROMPT already allows
+empty output — we just make silence more likely for ambient triggers. This
+halves latency and cost vs. a separate classifier step, and leverages
+existing infrastructure.
 
-- `ownerCusId`: from `client.info.wid._serialized` OR `process.env.OWNER_ID` — used to identify self-chat (chat.id === ownerCusId)
-- `ownerLidId`: from `process.env.OWNER_LID` — used for mention detection in groups (WhatsApp uses `@lid` in group mentions)
-- `ownerIds`: `[ownerCusId, ownerLidId]` — both IDs that count as "us"
+## Project state (as of 2026-04-18)
 
-## Environment
+- Build: `npm run build` → `tsc`, exits 0
+- Tests: 139 passing across 10 files
+- Source files in `src/`: claude.ts, commands.ts, events.ts, extract.ts,
+  index.ts, memory-bootstrap.ts, memory-guard.ts, memory.ts, prompts.ts,
+  setup.ts, stats.ts, whatsapp.ts (+ matching `.test.ts`)
+- Conventions: TypeScript CommonJS, Vitest, tsx, single-brace `{KEY}`
+  placeholders, atomic file writes via tmp+rename, no emojis in code.
+- `data/` is the runtime root. `data/contacts/*.md` is the per-contact memory.
+  `data/voice_profile.md` is the voice profile. Both gitignored.
 
-- Runs on Linux (Ubuntu). Node 20+. git installed.
-- `claude` CLI on PATH.
-- whatsapp-web.js installed from github main (past v1.34.6).
-- Chromium with `--no-sandbox` due to AppArmor on Ubuntu 23.10+.
+## New files this batch introduces
 
-## Dependency guidance
+- `src/fuzzy.ts` — Dice-coefficient bigram fuzzy match helper (pure function)
+- `src/ambient.ts` — ambient config I/O, topic bank builder, should-reply gate
+- `data/ambient-config.json` — persisted state (gitignored)
 
-- Prefer adding no new runtime deps. Use node built-ins where possible.
-- Exception: if a command-mode command needs argument parsing more complex than `.split(' ')`, still do it by hand — keep the dep list tight.
+## Dependencies to add
+None — all helpers are written in pure TS using node built-ins.

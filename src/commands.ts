@@ -4,6 +4,14 @@ import { writeContactMemoryGuarded } from './memory';
 import { computeStats, formatStats } from './stats';
 import { logEvent } from './events';
 import { getEventsPath } from './events';
+import {
+  loadAmbientConfig,
+  saveAmbientConfig,
+  ensureDailyReset,
+  buildTopicBank,
+  loadMemoryTopics,
+  maybeRefreshVoiceProfileTopics,
+} from './ambient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,7 +115,11 @@ const HELP_TEXT = `Commands available:
   !who <jid|name>                — show a contact's memory file (or search by name)
   !status                        — show bot stats for the last 24h
   !silence <chat|all> <dur>      — mute a chat (or all chats); dur = Nm, Nh, Nd
-  !resume                        — clear all silences`;
+  !resume                        — clear all silences
+  !ambient on|off [chat]         — enable/disable ambient replies globally or per-chat
+  !ambient status|cap|threshold  — show or change ambient config
+  !ambient refresh               — re-extract topics from voice profile + memory
+  !topic add|remove|list <phrase> — manage the fuzzy-match topic bank`;
 
 // ---------------------------------------------------------------------------
 // Command handlers
@@ -327,6 +339,177 @@ async function cmdResume(ctx: CommandContext): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// !ambient command handler
+// ---------------------------------------------------------------------------
+
+async function cmdAmbient(parsed: ParsedCommand, ctx: CommandContext): Promise<void> {
+  const sub = parsed.argv[0]?.toLowerCase();
+  const arg = parsed.argv[1];
+
+  // Load config, run daily reset before reading any state
+  const cfg = ensureDailyReset(loadAmbientConfig());
+
+  if (sub === 'on') {
+    if (arg) {
+      // !ambient on <chat> — remove from disabledGroups
+      const key = normalizeChatKey(arg);
+      const updated = {
+        ...cfg,
+        disabledGroups: cfg.disabledGroups.filter(g => normalizeChatKey(g) !== key),
+      };
+      saveAmbientConfig(updated);
+      await ctx.reply(`ok, re-enabled ambient in ${key}`);
+    } else {
+      // !ambient on — enable globally
+      const disabledList =
+        cfg.disabledGroups.length > 0 ? cfg.disabledGroups.join(', ') : 'none';
+      const updated = { ...cfg, masterEnabled: true };
+      saveAmbientConfig(updated);
+      await ctx.reply(`ok, ambient on. applies to all groups except: ${disabledList}`);
+    }
+    return;
+  }
+
+  if (sub === 'off') {
+    if (arg) {
+      // !ambient off <chat> — add to disabledGroups (no duplicate)
+      const key = normalizeChatKey(arg);
+      const alreadyDisabled = cfg.disabledGroups.some(g => normalizeChatKey(g) === key);
+      const updated = {
+        ...cfg,
+        disabledGroups: alreadyDisabled
+          ? cfg.disabledGroups
+          : [...cfg.disabledGroups, key],
+      };
+      saveAmbientConfig(updated);
+      await ctx.reply(`ok, disabled ambient in ${key}`);
+    } else {
+      // !ambient off — master kill switch
+      const updated = { ...cfg, masterEnabled: false };
+      saveAmbientConfig(updated);
+      await ctx.reply('ok, ambient off globally');
+    }
+    return;
+  }
+
+  if (sub === 'status') {
+    const memoryTopics = loadMemoryTopics();
+    const topicBank = buildTopicBank(cfg, memoryTopics);
+    const voiceProfileTopics = cfg.voiceProfileTopics;
+    const lines = [
+      `ambient master: ${cfg.masterEnabled ? 'on' : 'off'}`,
+      `disabled groups: ${cfg.disabledGroups.length > 0 ? cfg.disabledGroups.join(', ') : 'none'}`,
+      `daily cap: ${cfg.dailyCap}`,
+      `threshold: ${cfg.confidenceThreshold}`,
+      `replies today: ${cfg.repliesToday.length}`,
+      `topics: explicit=${cfg.explicitTopics.length} voice=${voiceProfileTopics.length} memory=${memoryTopics.length} bank=${topicBank.length}`,
+    ];
+    await ctx.reply(lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'cap') {
+    const n = parseInt(arg ?? '', 10);
+    if (isNaN(n) || n <= 0 || String(n) !== (arg ?? '').trim()) {
+      await ctx.reply('invalid cap: must be a positive integer');
+      return;
+    }
+    const updated = { ...cfg, dailyCap: n };
+    saveAmbientConfig(updated);
+    await ctx.reply(`ok, daily cap set to ${n}`);
+    return;
+  }
+
+  if (sub === 'threshold') {
+    const n = parseFloat(arg ?? '');
+    if (isNaN(n) || n < 0 || n > 1) {
+      await ctx.reply('invalid threshold: must be a number between 0 and 1');
+      return;
+    }
+    const updated = { ...cfg, confidenceThreshold: n };
+    saveAmbientConfig(updated);
+    await ctx.reply(`ok, threshold set to ${n}`);
+    return;
+  }
+
+  if (sub === 'refresh') {
+    const voiceResult = await maybeRefreshVoiceProfileTopics();
+    // Reload config after voice refresh in case it was updated
+    const cfgAfter = ensureDailyReset(loadAmbientConfig());
+    const memoryTopics = loadMemoryTopics();
+    const topicBank = buildTopicBank(cfgAfter, memoryTopics);
+    await ctx.reply(
+      `ok, refreshed: voice=${voiceResult.count} memory=${memoryTopics.length} total=${topicBank.length}`,
+    );
+    return;
+  }
+
+  // Unknown sub-command
+  await ctx.reply('usage: !ambient on|off [chat] | status | cap <n> | threshold <n> | refresh');
+}
+
+// ---------------------------------------------------------------------------
+// !topic command handler
+// ---------------------------------------------------------------------------
+
+async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<void> {
+  const sub = parsed.argv[0]?.toLowerCase();
+  const phrase = parsed.argv.slice(1).join(' ').trim().toLowerCase();
+
+  // Load config, run daily reset before reading any state
+  const cfg = ensureDailyReset(loadAmbientConfig());
+
+  if (sub === 'add') {
+    if (!phrase) {
+      await ctx.reply('usage: !topic add <phrase>');
+      return;
+    }
+    const alreadyExists = cfg.explicitTopics.some(t => t.toLowerCase() === phrase);
+    if (!alreadyExists) {
+      const updated = { ...cfg, explicitTopics: [...cfg.explicitTopics, phrase] };
+      saveAmbientConfig(updated);
+      await ctx.reply(`ok, added ${phrase}. total: ${updated.explicitTopics.length}`);
+    } else {
+      await ctx.reply(`already in list: ${phrase}. total: ${cfg.explicitTopics.length}`);
+    }
+    return;
+  }
+
+  if (sub === 'remove') {
+    if (!phrase) {
+      await ctx.reply('usage: !topic remove <phrase>');
+      return;
+    }
+    const exists = cfg.explicitTopics.some(t => t.toLowerCase() === phrase);
+    if (!exists) {
+      await ctx.reply(`not in list: ${phrase}`);
+      return;
+    }
+    const updated = {
+      ...cfg,
+      explicitTopics: cfg.explicitTopics.filter(t => t.toLowerCase() !== phrase),
+    };
+    saveAmbientConfig(updated);
+    await ctx.reply(`ok, removed ${phrase}`);
+    return;
+  }
+
+  if (sub === 'list') {
+    const memoryTopics = loadMemoryTopics();
+    const lines = [
+      `topics (explicit, ${cfg.explicitTopics.length}): ${cfg.explicitTopics.join(', ') || '(none)'}`,
+      `topics (voice, ${cfg.voiceProfileTopics.length}): ${cfg.voiceProfileTopics.join(', ') || '(none)'}`,
+      `topics (memory, ${memoryTopics.length}): ${memoryTopics.join(', ') || '(none)'}`,
+    ];
+    await ctx.reply(lines.join('\n'));
+    return;
+  }
+
+  // Unknown sub-command
+  await ctx.reply('usage: !topic add|remove|list <phrase>');
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
 
@@ -362,6 +545,12 @@ export async function dispatchCommand(
         break;
       case 'resume':
         await cmdResume(ctx);
+        break;
+      case 'ambient':
+        await cmdAmbient(parsed, ctx);
+        break;
+      case 'topic':
+        await cmdTopic(parsed, ctx);
         break;
       default:
         await ctx.reply(`unknown command: ${parsed.name}. try !help`);

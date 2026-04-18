@@ -160,6 +160,37 @@ MENTION:
 AFTER:
 {AFTER_MESSAGES}`;
 
+export const AMBIENT_PROMPT_PREFIX = `IMPORTANT: This is an AMBIENT trigger. No one @-mentioned Nick and no one replied to him. You're joining the conversation unprompted because the topic seemed relevant.
+
+Ambient replies are high-risk for sounding bot-like or weird. Your default should be SILENCE. Only produce a reply if all three hold:
+  1. The message is genuinely about Nick OR about a topic Nick would deeply care about
+  2. Nick would realistically chime in here unprompted — not just theoretically have an opinion, but actually bother typing
+  3. The reply fits Nick's voice as-is (no "btw" or "just jumping in" scaffolding unless his profile shows that pattern)
+
+If in any doubt, output nothing. Empty output is the RIGHT answer for most ambient triggers.
+
+When you do reply, do NOT acknowledge that you weren't mentioned. Do not say "falando nisso" or "just saw this" — the voice profile governs how Nick would naturally interject.
+
+`;
+
+export const VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT = `You will receive Nick's voice profile — an analysis of how he writes on WhatsApp. Extract a concise list of TOPICS OR INTERESTS he talks about or clearly cares about. The output is a fuzzy-match bank — optimize for recall, not precision. One topic per line. Lowercase. No bullets, no numbering, no explanation. Maximum 20 lines.
+
+Include:
+- Named interests (sports he follows, hobbies, places he visits, technologies he uses)
+- Work/domain topics
+- Recurring life themes (partner's name, pet's name, family, close friends)
+
+Do NOT include:
+- Generic categories like "life" or "work" (too broad)
+- Words from the DON'Ts section
+- Punctuation-only lines
+
+# VOICE PROFILE
+
+{VOICE_PROFILE}
+
+# OUTPUT (one topic per line, max 20, lowercase)`;
+
 export function fillTemplate(template: string, vars: Record<string, string>): string {
   let result = template;
   for (const key of Object.keys(vars)) {
