@@ -64,6 +64,8 @@ The following profile describes how the user writes. Follow it precisely — rhy
 
 {VOICE_PROFILE_GOES_HERE}
 
+{CONTACT_CONTEXT}
+
 # CONTEXT FORMAT
 
 You will receive up to 10 messages from BEFORE the mention and up to 10 messages from AFTER (the AFTER block may be empty). Messages are formatted as:
@@ -117,3 +119,78 @@ export function fillTemplate(template: string, vars: Record<string, string>): st
   }
   return result;
 }
+
+// Memory update prompt. Takes the current per-contact memory file (possibly
+// empty), the observed chat exchange, and the bot's generated reply, and
+// returns an updated memory file. The LLM is instructed to preserve facts,
+// append new ones, close resolved threads, and compact the raw notes when
+// the file would exceed its size budget.
+export const MEMORY_UPDATE_PROMPT = `You maintain a personal memory file about a single person that Nick talks to on WhatsApp. Your job is to read the current file, read what just happened in chat, and produce an updated version of the file.
+
+# CURRENT FILE
+
+The current memory file is below. If it says "(no file yet)", you are creating a new file from scratch.
+
+---
+{CURRENT_MEMORY}
+---
+
+# WHAT JUST HAPPENED
+
+Contact's display name: {CONTACT_NAME}
+Contact's WhatsApp ID: {CONTACT_JID}
+
+Recent chat context (most recent messages from the group where Nick was mentioned):
+
+BEFORE:
+{BEFORE_MESSAGES}
+
+MENTION:
+{MENTION_MESSAGE}
+
+AFTER:
+{AFTER_MESSAGES}
+
+Nick's reply: {NICK_REPLY}
+
+Today's date: {TODAY}
+
+# OUTPUT FORMAT
+
+Output ONLY the updated memory file, ready to be written to disk. No preamble, no explanation, no code fences. Use this exact structure:
+
+# <Contact name>
+
+## Identity
+- Phone / JID info (preserve whatever was there; add aliases if new ones observed)
+- First seen: <date, preserve original if file existed>
+- Last updated: {TODAY}
+
+## Facts
+- <stable facts about the person: where they work, who they know, location, life events>
+
+## Recurring topics
+- <topics they and Nick keep coming back to>
+
+## Open threads
+- <unresolved conversations, promises, pending meetings, favors asked>
+- If a thread was resolved by this exchange, REMOVE it (don't keep a "closed" section)
+
+## How Nick talks to them
+- <relationship register — formal / jokey / specific slang Nick uses with them / language they mix>
+
+## Raw notes
+- <free-form observations that don't fit the sections above yet — keep append-only until a pattern emerges>
+
+# RULES
+
+- Base every entry on observed evidence in the current file or this exchange. Do not invent.
+- Preserve existing facts unless this exchange clearly contradicts them.
+- If this exchange opens a new thread (promise, planned meeting, favor asked), add it to "Open threads".
+- If this exchange resolves an existing thread (meeting happened, favor done), remove it from "Open threads".
+- Keep the whole file under ~3000 characters. If it would exceed that, compact "Raw notes" by merging similar observations and promoting stable patterns to the structured sections.
+- If the exchange genuinely reveals nothing new about this person (e.g., they weren't involved in a meaningful way), output the current file UNCHANGED except for "Last updated".
+- Do not include Nick in the file — this is a profile of the OTHER person.
+- Do not include full message bodies or PII that wasn't already disclosed in the current file.
+
+Produce the updated file now.`;

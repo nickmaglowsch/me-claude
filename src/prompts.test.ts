@@ -30,9 +30,29 @@ describe('fillTemplate', () => {
   it('RUNTIME_PROMPT smoke test — no unfilled placeholders after fill', () => {
     const result = fillTemplate(RUNTIME_PROMPT, {
       VOICE_PROFILE_GOES_HERE: 'v',
+      CONTACT_CONTEXT: '',
       BEFORE_MESSAGES: 'b',
       MENTION_MESSAGE: 'm',
       AFTER_MESSAGES: 'a',
+    });
+    expect(result).not.toMatch(/\{[A-Z_]+\}/);
+  });
+
+  it('RUNTIME_PROMPT contains CONTACT_CONTEXT placeholder', () => {
+    expect(RUNTIME_PROMPT).toContain('{CONTACT_CONTEXT}');
+  });
+
+  it('MEMORY_UPDATE_PROMPT smoke test — no unfilled placeholders after fill', async () => {
+    const { MEMORY_UPDATE_PROMPT } = await import('./prompts');
+    const result = fillTemplate(MEMORY_UPDATE_PROMPT, {
+      CURRENT_MEMORY: 'none',
+      CONTACT_NAME: 'Alice',
+      CONTACT_JID: '5511987654321@c.us',
+      BEFORE_MESSAGES: 'b',
+      MENTION_MESSAGE: 'm',
+      AFTER_MESSAGES: 'a',
+      NICK_REPLY: 'r',
+      TODAY: '2026-04-18',
     });
     expect(result).not.toMatch(/\{[A-Z_]+\}/);
   });

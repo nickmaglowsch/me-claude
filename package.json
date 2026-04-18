@@ -5,6 +5,7 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "setup": "tsx src/setup.ts",
+    "memory:bootstrap": "tsx src/memory-bootstrap.ts",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest"

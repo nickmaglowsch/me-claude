@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/session/
 data/voice_profile.md
+data/contacts/
 .env
 .wwebjs_cache/
 .claude/
