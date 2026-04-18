@@ -8,7 +8,8 @@ import {
 } from './whatsapp';
 import { callClaude } from './claude';
 import { BOOTSTRAP_PROMPT, fillTemplate } from './prompts';
-import { writeContactMemory, readContactMemory, isCusJid } from './memory';
+import { writeContactMemoryGuarded, readContactMemory, isCusJid } from './memory';
+import { logEvent } from './events';
 
 // CLI flag parser — simple, no dep. Supports "--key=value" and "--key value".
 function parseFlag(name: string, defaultValue: number): number {
@@ -177,11 +178,13 @@ async function main(): Promise<void> {
   for (const entry of ordered) {
     if (entry.totalTheirMessages < minMessagesFromThem) {
       skippedTooFew++;
+      logEvent({ kind: 'bootstrap.contact_skipped', sender_jid: entry.cusJid, reason: 'too_few_messages' });
       continue;
     }
     if (readContactMemory(entry.cusJid)) {
       console.log(`  skip ${entry.cusJid} "${entry.name}": file already exists`);
       skippedFileExists++;
+      logEvent({ kind: 'bootstrap.contact_skipped', sender_jid: entry.cusJid, reason: 'file_exists' });
       continue;
     }
 
@@ -218,21 +221,31 @@ async function main(): Promise<void> {
       NICK_MESSAGES: nickLines,
     });
 
+    const writeStart = Date.now();
     try {
       const output = (await callClaude(prompt)).trim();
       if (!output) {
         console.warn(`  empty output for ${entry.cusJid} "${entry.name}" — skipping`);
         skippedClaudeEmpty++;
+        logEvent({ kind: 'bootstrap.contact_skipped', sender_jid: entry.cusJid, reason: 'claude_empty' });
         continue;
       }
-      writeContactMemory(entry.cusJid, output);
+      const guardResult = await writeContactMemoryGuarded(entry.cusJid, output, { reason: 'bootstrap' });
+      if (guardResult.status === 'rejected') {
+        console.warn(`  guard rejected ${entry.cusJid} "${entry.name}": ${guardResult.reason}`);
+        skippedClaudeEmpty++; // reuse the skip counter for guard rejections
+        logEvent({ kind: 'bootstrap.contact_skipped', sender_jid: entry.cusJid, reason: `guard_rejected: ${guardResult.reason}` });
+        continue;
+      }
       console.log(
-        `  wrote ${entry.cusJid} "${entry.name}" — ${entry.groups.size} group(s), ${entry.totalTheirMessages} of their msgs, ${output.length} chars`,
+        `  wrote ${entry.cusJid} "${entry.name}" — ${entry.groups.size} group(s), ${entry.totalTheirMessages} of their msgs, ${output.length} chars [guard: ${guardResult.status}]`,
       );
+      logEvent({ kind: 'bootstrap.contact_written', sender_jid: entry.cusJid, duration_ms: Date.now() - writeStart });
       written++;
     } catch (err) {
       console.warn(`  claude failed for ${entry.cusJid} "${entry.name}": ${(err as Error).message.split('\n')[0]}`);
       skippedClaudeErr++;
+      logEvent({ kind: 'bootstrap.contact_skipped', sender_jid: entry.cusJid, reason: `claude_error: ${(err as Error).message.split('\n')[0]}` });
     }
   }
 

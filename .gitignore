@@ -7,3 +7,4 @@ data/contacts/
 .wwebjs_cache/
 .claude/
 *.log
+data/events.jsonl

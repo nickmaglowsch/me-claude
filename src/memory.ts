@@ -45,6 +45,12 @@ export function writeContactMemory(cusJid: string, contents: string): void {
   fs.renameSync(tmpPath, finalPath);
 }
 
+// Guarded write with corruption detection and auto git commit.
+// Re-exported here for backwards-compatibility so callers can import from
+// either 'memory' or 'memory-guard'. The guard module does NOT import from
+// memory.ts to avoid circular dependencies — it computes its own paths.
+export { writeContactMemoryGuarded } from './memory-guard';
+
 export function listContactMemories(): string[] {
   try {
     return fs

@@ -11,11 +11,22 @@ import {
 import { callClaudeWithTools } from './claude';
 import { RUNTIME_PROMPT, fillTemplate } from './prompts';
 import { resolveToCus } from './memory';
+import { logEvent } from './events';
+import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
 const RATE_LIMIT_MS = 10_000;  // 1 reply per group per 10 seconds
 const AFTER_WAIT_MS = 8_000;   // wait before replying (to collect after-messages)
+
+// Silence map: chat-name → muted-until-ms; "*" key for global mute.
+// Managed by the !silence / !resume commands.
+const silences = new Map<string, number>();
+
+// Recursion guard: track message IDs of bot replies so they don't re-trigger
+// the handler. Bounded to ~100 entries to prevent unbounded growth.
+const recentOutboundIds = new Set<string>();
+const MAX_OUTBOUND_IDS = 100;
 
 // Exported pure helpers for testability
 
@@ -62,6 +73,11 @@ export function sleep(ms: number): Promise<void> {
 // Memory read/write is now handled by Claude itself via Read/Edit/Write tools
 // in callClaudeWithTools. We no longer pre-load memory files or post-write them
 // from here — Claude decides what to read and what to update on its own.
+//
+// TODO(memory-guard): Claude's Edit/Write tool calls bypass memory-guard.ts entirely.
+// guardedWriteContactMemory is only invoked by memory-bootstrap.ts. A future task
+// can add a post-claude hook that inspects git diff after callClaudeWithTools returns
+// and validates any memory file changes against the corruption rules retroactively.
 
 async function main(): Promise<void> {
   const client = createClient();
@@ -111,18 +127,65 @@ async function main(): Promise<void> {
       // Top-of-handler log so we can confirm the event is firing at all
       dbg(`event fromMe=${msg.fromMe} hasQuoted=${msg.hasQuotedMsg} body="${(msg.body || '').slice(0, 40)}"`);
 
+      // Recursion guard: skip any message we sent ourselves (bot replies to
+      // commands would otherwise re-trigger the handler in an infinite loop).
+      const msgId = msg.id?._serialized;
+      if (msgId && recentOutboundIds.has(msgId)) {
+        dbg(`skip: outbound message already processed (id=${msgId})`);
+        return;
+      }
+
       // Gate 1: must be in a group chat
       let chat;
       try {
         chat = await msg.getChat();
       } catch (e) {
         dbg(`skip: getChat failed: ${(e as Error).message}`);
+        logEvent({ kind: 'skip.get_chat_failed', reason: (e as Error).message });
         return;
       }
-      if (!chat.isGroup) { dbg(`skip: not a group (${chat.name ?? chat.id?._serialized})`); return; }
+
+      // Self-chat command gate: fromMe + self-chat + starts with "!"
+      // This MUST fire before the group gate so commands work in the self-chat DM.
+      if (msg.fromMe && chat?.id?._serialized === ownerCusId) {
+        const body = (msg.body || '').trim();
+        if (body.startsWith('!')) {
+          const parsed = parseCommand(body);
+          if (parsed) {
+            await dispatchCommand(parsed, {
+              ownerCusId,
+              reply: async (text: string) => {
+                const sentMsg = await chat.sendMessage(text);
+                // Track outbound reply IDs to prevent recursion
+                const sentId = sentMsg?.id?._serialized;
+                if (sentId) {
+                  recentOutboundIds.add(sentId);
+                  // Bounded LRU-ish eviction: drop oldest entries over cap
+                  if (recentOutboundIds.size > MAX_OUTBOUND_IDS) {
+                    const first = recentOutboundIds.values().next().value;
+                    if (first !== undefined) recentOutboundIds.delete(first);
+                  }
+                }
+              },
+              silences,
+            });
+            return;
+          }
+        }
+      }
+
+      if (!chat.isGroup) {
+        dbg(`skip: not a group (${chat.name ?? chat.id?._serialized})`);
+        logEvent({ kind: 'skip.not_in_group', chat: chat.name ?? chat.id?._serialized });
+        return;
+      }
 
       // Gate 2: must not be our own message
-      if (msg.fromMe) { dbg(`skip: fromMe in [${chat.name}]`); return; }
+      if (msg.fromMe) {
+        dbg(`skip: fromMe in [${chat.name}]`);
+        logEvent({ kind: 'skip.from_me', chat: chat.name, chat_id: chat.id?._serialized });
+        return;
+      }
 
       // Log every group message received with mention info so we can see the raw shape
       dbg(`msg in [${chat.name}]: body="${(msg.body || '').slice(0, 60)}" mentionedIds=${JSON.stringify(msg.mentionedIds)} hasQuoted=${msg.hasQuotedMsg}`);
@@ -141,6 +204,7 @@ async function main(): Promise<void> {
       }
       if (!trigger) {
         dbg(`skip: not mentioned, not a reply to us (owners=${JSON.stringify(ownerIds)})`);
+        logEvent({ kind: 'skip.not_mentioned', chat: chat.name, chat_id: chat.id?._serialized });
         return;
       }
 
@@ -151,9 +215,22 @@ async function main(): Promise<void> {
       const nowMs = Date.now();
       if (isRateLimited(lastReplyAt, groupJid, nowMs, RATE_LIMIT_MS)) {
         console.log(`[${trigger}] skipped: rate-limited in [${chat.name}]`);
+        logEvent({ kind: 'skip.rate_limited', chat: chat.name, chat_id: groupJid, trigger });
         return;
       }
       recordReply(lastReplyAt, groupJid, nowMs);
+
+      // Silence check: global mute ("*") or per-chat mute
+      if (silences.has('*') && silences.get('*')! > Date.now()) {
+        dbg(`skip: globally silenced`);
+        logEvent({ kind: 'skip.silenced', reason: 'global', chat: chat.name, chat_id: groupJid });
+        return;
+      }
+      if (silences.has(normalizeChatKey(chat.name)) && silences.get(normalizeChatKey(chat.name))! > Date.now()) {
+        dbg(`skip: silenced chat [${chat.name}]`);
+        logEvent({ kind: 'skip.silenced', reason: 'per-chat', chat: chat.name, chat_id: groupJid });
+        return;
+      }
 
       // Fetch BEFORE context: last 11 messages, exclude the mention itself
       const beforeFetch = await chat.fetchMessages({ limit: 11 });
@@ -208,18 +285,50 @@ async function main(): Promise<void> {
       };
       dbg(`handing off to claude w/ tools; sender=${vars.SENDER_JID}`);
 
+      const callStart = Date.now();
       const response = await callClaudeWithTools(fillTemplate(RUNTIME_PROMPT, vars));
+      const callDurationMs = Date.now() - callStart;
       const reply = response.trim();
 
       // Silence is allowed — if Claude returns empty, skip
-      if (!reply) return;
+      if (!reply) {
+        logEvent({
+          kind: 'reply.silent',
+          chat: chat.name,
+          chat_id: groupJid,
+          sender_name: mentionSenderName,
+          sender_jid: vars.SENDER_JID,
+          trigger,
+          duration_ms: callDurationMs,
+        });
+        return;
+      }
 
-      await msg.reply(reply);
+      const sentMsg = await msg.reply(reply);
+      // Track outbound ID for recursion guard
+      const sentId = sentMsg?.id?._serialized;
+      if (sentId) {
+        recentOutboundIds.add(sentId);
+        if (recentOutboundIds.size > MAX_OUTBOUND_IDS) {
+          const first = recentOutboundIds.values().next().value;
+          if (first !== undefined) recentOutboundIds.delete(first);
+        }
+      }
 
       // Log the handled mention
       console.log(`[${chat.name}] ${mentionSenderName}: ${msg.body} -> ${reply}`);
+      logEvent({
+        kind: 'reply.sent',
+        chat: chat.name,
+        chat_id: groupJid,
+        sender_name: mentionSenderName,
+        sender_jid: vars.SENDER_JID,
+        trigger,
+        duration_ms: callDurationMs,
+      });
     } catch (err) {
       console.error('Error handling message:', err);
+      logEvent({ kind: 'error', reason: (err as Error).message });
     }
   });
 

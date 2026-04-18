@@ -90,6 +90,38 @@ OWNER_LID=261460529811482@lid
 | `data/session/` | WhatsApp session data (gitignored) |
 | `docs/contact-memory.md` | Design doc for the memory system (future phases) |
 
+## Command Mode
+
+When you send a message to **yourself** on WhatsApp starting with `!`, the bot treats it as a command rather than a mention. Commands let you teach, correct, and control the bot without editing files.
+
+**Security model**: Command mode fires only when all three hold:
+- `msg.fromMe === true` — the message comes from your own session
+- The chat is your self-chat (only your JID talks to itself)
+- The body starts with `!`
+
+Messages you send in group chats or DMs to other people that start with `!` are ignored by the command gate.
+
+### Commands
+
+| Command | Example | Description |
+|---|---|---|
+| `!help` | `!help` | List all available commands |
+| `!remember <jid> <fact...>` | `!remember 5511987@c.us Alice got a dog` | Append a fact to a contact's memory file (creates file if missing) |
+| `!forget <jid>` | `!forget 5511987@c.us` | Delete a contact's memory file |
+| `!who <jid\|name>` | `!who 5511987@c.us` or `!who Alice` | Show a contact's memory file; search by name if no JID suffix |
+| `!status` | `!status` | Show bot stats for the last 24 hours |
+| `!silence <chat\|all> <duration>` | `!silence mgz 2h` | Mute a specific chat or all chats; duration: `Nm`, `Nh`, `Nd` |
+| `!resume` | `!resume` | Clear all silences and resume normal operation |
+
+### Silence examples
+
+```
+!silence mgz 30m      # mute the "mgz" group for 30 minutes
+!silence mgz 2h       # mute for 2 hours
+!silence all 1d       # global mute for 1 day
+!resume               # unmute everything immediately
+```
+
 ## Development
 
 ```bash

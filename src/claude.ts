@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { logEvent } from './events';
 
 // Exported for testing — tests can mutate these properties to swap the binary
 export const _config = {
@@ -13,8 +14,10 @@ function runClaude(
   extraArgs: string[],
   timeoutMs: number,
   cwd?: string,
+  variant?: string,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
+    const startMs = Date.now();
     const child = spawn(_config.command, [..._config.args, ...extraArgs], {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
@@ -34,16 +37,21 @@ function runClaude(
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill();
+      const durationMs = Date.now() - startMs;
+      logEvent({ kind: 'error', reason: `claude CLI timed out after ${timeoutMs / 1000}s`, duration_ms: durationMs, variant });
       reject(new Error(`claude CLI timed out after ${timeoutMs / 1000}s`));
     }, timeoutMs);
 
     child.on('close', (code) => {
       clearTimeout(timer);
       if (timedOut) return; // already rejected
+      const durationMs = Date.now() - startMs;
       if (code !== 0) {
         const stderr = Buffer.concat(stderrChunks).toString();
+        logEvent({ kind: 'error', reason: `claude CLI exited with code ${code}`, duration_ms: durationMs, variant });
         reject(new Error(`claude CLI exited with code ${code}: ${stderr}`));
       } else {
+        logEvent({ kind: 'claude.call', duration_ms: durationMs, variant });
         const stdout = Buffer.concat(stdoutChunks).toString();
         resolve(stdout.trim());
       }
@@ -54,7 +62,7 @@ function runClaude(
 // Plain prompt → response. No tools. Used by setup and bootstrap where
 // we want a deterministic text-in / text-out transformation.
 export async function callClaude(prompt: string): Promise<string> {
-  return runClaude(prompt, [], _config.timeoutMs);
+  return runClaude(prompt, [], _config.timeoutMs, undefined, 'no-tools');
 }
 
 // Prompt → response with tool access enabled. Claude may Read, Edit, Write,
@@ -75,5 +83,5 @@ export async function callClaudeWithTools(
     '--output-format',
     'text',
   ];
-  return runClaude(prompt, toolArgs, _config.toolTimeoutMs, cwd);
+  return runClaude(prompt, toolArgs, _config.toolTimeoutMs, cwd, 'with-tools');
 }
