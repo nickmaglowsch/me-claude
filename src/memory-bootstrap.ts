@@ -13,7 +13,6 @@ import {
   writeContactMemory,
   readContactMemory,
   isCusJid,
-  resolveToCus,
 } from './memory';
 
 // CLI flag parser — simple, no dep. Supports "--key=value" and "--key value".
@@ -108,11 +107,32 @@ async function main(): Promise<void> {
     for (const [authorJid, authorMsgs] of byAuthor) {
       contactsProcessed++;
       if (authorMsgs.length < minMessagesFromThem) {
+        console.log(`  skip ${authorJid}: only ${authorMsgs.length} messages (<${minMessagesFromThem})`);
         contactsSkipped++;
         continue;
       }
-      const cusJid = resolveToCus(authorJid, chat);
-      if (!cusJid || !isCusJid(cusJid)) {
+
+      // Canonical key: resolve via the Contact object, which always yields
+      // the @c.us form regardless of whether `msg.author` was @lid or @c.us.
+      // This is more reliable than walking `chat.participants` because the
+      // participants list sometimes doesn't expose the `lid` field.
+      let contactName = 'Unknown';
+      let cusJid: string | null = null;
+      try {
+        const contact = await authorMsgs[0].getContact();
+        contactName = contact.pushname || contact.number || authorJid;
+        const contactId = contact.id?._serialized;
+        if (contactId && isCusJid(contactId)) {
+          cusJid = contactId;
+        }
+      } catch (err) {
+        console.log(`  skip ${authorJid}: getContact failed: ${(err as Error).message.split('\n')[0]}`);
+        contactsSkipped++;
+        continue;
+      }
+
+      if (!cusJid) {
+        console.log(`  skip ${authorJid}: could not resolve to @c.us (contactName=${contactName})`);
         contactsSkipped++;
         continue;
       }
@@ -123,17 +143,6 @@ async function main(): Promise<void> {
         console.log(`  skip ${cusJid}: file already exists`);
         contactsSkipped++;
         continue;
-      }
-
-      // Build a lightweight exchange summary. Bootstrap doesn't have a
-      // single "mention" to hang off of, so we feed the last ~20 messages
-      // from this author + Nick's last ~10 replies as the "exchange".
-      let contactName = 'Unknown';
-      try {
-        const contact = await authorMsgs[0].getContact();
-        contactName = contact.pushname || contact.number || authorJid;
-      } catch {
-        /* fall through with 'Unknown' */
       }
 
       // Messages from this contact (most recent 20)

@@ -6,10 +6,11 @@ import path from 'path';
 // atomically written via tmp+rename so crashes mid-write can't corrupt them.
 export const CONTACTS_DIR = path.join(process.cwd(), 'data', 'contacts');
 
-// Max size for a single contact memory file injected into the runtime prompt.
-// When a file exceeds this, we log a warning at read time; auto-compaction is
-// deferred per the design doc.
-export const MAX_MEMORY_CHARS = 3072;
+// Soft warning threshold for per-contact memory files. Under tool-access
+// runtime, Claude reads only the files it wants via the Read tool, so large
+// files don't blow up every prompt anymore — this is only a hint for the
+// memory-update prompt to compact.
+export const MAX_MEMORY_CHARS = 4096;
 
 // Cache: @lid → @c.us resolutions, populated lazily as we see new @lid mentions.
 // Cleared when the process restarts (acceptable — first reply after restart in
@@ -105,30 +106,6 @@ export function resolveToCus(jid: string, chat?: unknown): string | null {
   return null;
 }
 
-// Build the CONTACT_CONTEXT block for the runtime prompt. Returns empty string
-// when no files were found for any of the given JIDs — callers pass that
-// through to the template to drop the block entirely.
-export function buildContactContext(cusJids: string[]): string {
-  const seen = new Set<string>();
-  const blocks: string[] = [];
-  for (const jid of cusJids) {
-    if (seen.has(jid)) continue;
-    seen.add(jid);
-    const contents = readContactMemory(jid);
-    if (!contents) continue;
-    const clipped = contents.length > MAX_MEMORY_CHARS
-      ? contents.slice(0, MAX_MEMORY_CHARS) + '\n\n[...truncated]'
-      : contents;
-    blocks.push(clipped);
-  }
-  if (blocks.length === 0) return '';
-  return [
-    '# PEOPLE YOU KNOW',
-    '',
-    'Below is what you remember about the people in this chat. Use this to',
-    'pick tone and reference shared context. Do not recite these facts',
-    'unprompted — use them to shape how you respond.',
-    '',
-    blocks.join('\n\n---\n\n'),
-  ].join('\n');
-}
+// Note: buildContactContext was removed when the runtime switched to
+// tool-access (callClaudeWithTools). Claude now Reads contact files itself.
+// readContactMemory / writeContactMemory are kept for the bootstrap script.

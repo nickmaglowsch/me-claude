@@ -57,7 +57,7 @@ npm run memory:bootstrap
 npm run memory:bootstrap -- --top-k-chats=10 --min-messages-from-them=3 --min-messages-from-nick=3
 ```
 
-Memory files are updated automatically (fire-and-forget) after each bot reply. Review, edit, or delete files in `data/contacts/` at will — they're plain markdown. The entire directory is gitignored.
+Memory files are read and updated directly by Claude via filesystem tools (Read/Edit/Write/Grep/Glob) during each reply — a single subprocess call per mention. Claude decides what to read and what to update on its own. Review, edit, or delete files in `data/contacts/` at will — they're plain markdown. The entire directory is gitignored.
 
 ## Configuration
 

@@ -8,14 +8,9 @@ import {
   getOwnerId,
   formatMessageLine,
 } from './whatsapp';
-import { callClaude } from './claude';
-import { RUNTIME_PROMPT, MEMORY_UPDATE_PROMPT, fillTemplate } from './prompts';
-import {
-  resolveToCus,
-  buildContactContext,
-  readContactMemory,
-  writeContactMemory,
-} from './memory';
+import { callClaudeWithTools } from './claude';
+import { RUNTIME_PROMPT, fillTemplate } from './prompts';
+import { resolveToCus } from './memory';
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
@@ -64,44 +59,9 @@ export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-interface MemoryUpdateParams {
-  cusJid: string;
-  contactName: string;
-  beforeMessages: string;
-  mentionMessage: string;
-  afterMessages: string;
-  nickReply: string;
-}
-
-// Fire-and-forget per-contact memory update. Runs a second claude call with
-// the current file + observed exchange and writes the result atomically.
-// All errors are logged and swallowed — this is a side-channel, not a
-// critical path. Never crash the main bot because memory failed to update.
-async function updateContactMemory(p: MemoryUpdateParams): Promise<void> {
-  try {
-    const current = readContactMemory(p.cusJid) ?? '(no file yet)';
-    const today = new Date().toISOString().slice(0, 10);
-    const prompt = fillTemplate(MEMORY_UPDATE_PROMPT, {
-      CURRENT_MEMORY: current,
-      CONTACT_NAME: p.contactName,
-      CONTACT_JID: p.cusJid,
-      BEFORE_MESSAGES: p.beforeMessages,
-      MENTION_MESSAGE: p.mentionMessage,
-      AFTER_MESSAGES: p.afterMessages,
-      NICK_REPLY: p.nickReply,
-      TODAY: today,
-    });
-    const updated = (await callClaude(prompt)).trim();
-    if (!updated) {
-      console.warn(`[memory] empty update from claude for ${p.cusJid} — skipping write`);
-      return;
-    }
-    writeContactMemory(p.cusJid, updated);
-    console.log(`[memory] updated ${p.cusJid} (${updated.length} chars)`);
-  } catch (err) {
-    console.warn(`[memory] update failed for ${p.cusJid}:`, (err as Error).message);
-  }
-}
+// Memory read/write is now handled by Claude itself via Read/Edit/Write tools
+// in callClaudeWithTools. We no longer pre-load memory files or post-write them
+// from here — Claude decides what to read and what to update on its own.
 
 async function main(): Promise<void> {
   const client = createClient();
@@ -217,48 +177,38 @@ async function main(): Promise<void> {
         return formatMessageLine(m, senderName);
       };
 
-      // Format mention sender
+      // Format mention sender. Prefer the Contact object's @c.us id for the
+      // memory key — it's the canonical form Claude will use when Read/Edit'ing
+      // data/contacts/<jid>.md, regardless of whether msg.author was @lid.
       const mentionContact = await msg.getContact();
       const mentionSenderName = mentionContact.pushname || mentionContact.number || 'Someone';
+      const rawSenderJid = msg.author ?? msg.from;
+      const senderCus =
+        mentionContact.id?._serialized && mentionContact.id._serialized.endsWith('@c.us')
+          ? mentionContact.id._serialized
+          : resolveToCus(rawSenderJid, chat);
 
       // Format all message lines
       const beforeLines = await Promise.all(beforeMessages.map(formatLine));
       const afterLines = await Promise.all(afterMessages.map(formatLine));
       const mentionLine = formatMessageLine(msg, mentionSenderName);
 
-      // Collect interesting participants for contact memory injection:
-      //   - mention sender (always)
-      //   - quoted-message author if there is one
-      //   - up to 2 most-recent distinct authors in the before/after window
-      const quotedAuthor = msg.hasQuotedMsg
-        ? await msg.getQuotedMessage().then((q: any) => q?.author ?? q?.from).catch(() => null)
-        : null;
-      const recentAuthors: string[] = [];
-      for (const m of [...afterMessages].reverse().concat([...beforeMessages].reverse())) {
-        const author = (m as any).author ?? (m as any).from;
-        if (author && !recentAuthors.includes(author) && recentAuthors.length < 2) {
-          recentAuthors.push(author);
-        }
-      }
-      const mentionSenderJid = msg.author ?? msg.from;
-      const interestingJids = [mentionSenderJid, quotedAuthor, ...recentAuthors]
-        .filter((x): x is string => !!x);
-      const cusJids = interestingJids
-        .map(jid => resolveToCus(jid, chat))
-        .filter((x): x is string => !!x);
-      const contactContext = buildContactContext(cusJids);
-      dbg(`contact memory: ${cusJids.length} resolved jids, ${contactContext.length} chars injected`);
-
-      // Build prompt vars
+      // Build prompt vars. Memory file read/write is now Claude's job via
+      // Read/Edit/Write tools — we only hand it the sender's canonical JID
+      // so it knows which file to consult and update.
+      const today = new Date().toISOString().slice(0, 10);
       const vars = {
         VOICE_PROFILE_GOES_HERE: voiceProfile,
-        CONTACT_CONTEXT: contactContext,
+        SENDER_NAME: mentionSenderName,
+        SENDER_JID: senderCus ?? rawSenderJid ?? 'unknown',
+        TODAY: today,
         BEFORE_MESSAGES: beforeLines.length > 0 ? beforeLines.join('\n') : '(no messages before)',
         MENTION_MESSAGE: mentionLine,
         AFTER_MESSAGES: afterLines.length > 0 ? afterLines.join('\n') : '(no messages after yet)',
       };
+      dbg(`handing off to claude w/ tools; sender=${vars.SENDER_JID}`);
 
-      const response = await callClaude(fillTemplate(RUNTIME_PROMPT, vars));
+      const response = await callClaudeWithTools(fillTemplate(RUNTIME_PROMPT, vars));
       const reply = response.trim();
 
       // Silence is allowed — if Claude returns empty, skip
@@ -268,23 +218,6 @@ async function main(): Promise<void> {
 
       // Log the handled mention
       console.log(`[${chat.name}] ${mentionSenderName}: ${msg.body} -> ${reply}`);
-
-      // Fire-and-forget memory update for the mention sender. Errors are
-      // logged and swallowed — memory is a best-effort side-channel, it must
-      // never affect the user-visible reply path.
-      const senderCus = resolveToCus(mentionSenderJid, chat);
-      if (senderCus) {
-        void updateContactMemory({
-          cusJid: senderCus,
-          contactName: mentionSenderName,
-          beforeMessages: vars.BEFORE_MESSAGES,
-          mentionMessage: vars.MENTION_MESSAGE,
-          afterMessages: vars.AFTER_MESSAGES,
-          nickReply: reply,
-        });
-      } else {
-        dbg(`skip memory update: could not resolve ${mentionSenderJid} to @c.us`);
-      }
     } catch (err) {
       console.error('Error handling message:', err);
     }

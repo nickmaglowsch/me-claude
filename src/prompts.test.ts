@@ -30,7 +30,9 @@ describe('fillTemplate', () => {
   it('RUNTIME_PROMPT smoke test — no unfilled placeholders after fill', () => {
     const result = fillTemplate(RUNTIME_PROMPT, {
       VOICE_PROFILE_GOES_HERE: 'v',
-      CONTACT_CONTEXT: '',
+      SENDER_NAME: 'Alice',
+      SENDER_JID: '5511987654321@c.us',
+      TODAY: '2026-04-18',
       BEFORE_MESSAGES: 'b',
       MENTION_MESSAGE: 'm',
       AFTER_MESSAGES: 'a',
@@ -38,8 +40,11 @@ describe('fillTemplate', () => {
     expect(result).not.toMatch(/\{[A-Z_]+\}/);
   });
 
-  it('RUNTIME_PROMPT contains CONTACT_CONTEXT placeholder', () => {
-    expect(RUNTIME_PROMPT).toContain('{CONTACT_CONTEXT}');
+  it('RUNTIME_PROMPT contains SENDER_JID and tool instructions', () => {
+    expect(RUNTIME_PROMPT).toContain('{SENDER_JID}');
+    expect(RUNTIME_PROMPT).toContain('data/contacts/');
+    expect(RUNTIME_PROMPT).toContain('Read');
+    expect(RUNTIME_PROMPT).toContain('Edit');
   });
 
   it('MEMORY_UPDATE_PROMPT smoke test — no unfilled placeholders after fill', async () => {

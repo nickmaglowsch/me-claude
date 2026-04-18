@@ -8,11 +8,9 @@ import {
   writeContactMemory,
   listContactMemories,
   resolveToCus,
-  buildContactContext,
   isCusJid,
   isLidJid,
   CONTACTS_DIR,
-  MAX_MEMORY_CHARS,
 } from './memory';
 
 // Run tests in a temp cwd so they don't touch the real data/contacts/
@@ -177,59 +175,5 @@ describe('resolveToCus', () => {
   });
 });
 
-describe('buildContactContext', () => {
-  const SENTINEL_A = '99999999999999991@c.us';
-  const SENTINEL_B = '99999999999999992@c.us';
-
-  afterEach(() => {
-    for (const jid of [SENTINEL_A, SENTINEL_B]) {
-      try {
-        fs.unlinkSync(contactFilePath(jid));
-      } catch {
-        /* noop */
-      }
-    }
-  });
-
-  it('returns empty string when no files exist for any JID', () => {
-    expect(buildContactContext([SENTINEL_A, SENTINEL_B])).toBe('');
-  });
-
-  it('returns a block containing the contact memory when one file exists', () => {
-    writeContactMemory(SENTINEL_A, '# Alice\nFacts: works at Nubank');
-    const result = buildContactContext([SENTINEL_A]);
-    expect(result).toContain('PEOPLE YOU KNOW');
-    expect(result).toContain('works at Nubank');
-  });
-
-  it('concatenates multiple contact files with separators', () => {
-    writeContactMemory(SENTINEL_A, '# Alice');
-    writeContactMemory(SENTINEL_B, '# Bob');
-    const result = buildContactContext([SENTINEL_A, SENTINEL_B]);
-    expect(result).toContain('# Alice');
-    expect(result).toContain('# Bob');
-    expect(result).toContain('---');
-  });
-
-  it('deduplicates repeated JIDs', () => {
-    writeContactMemory(SENTINEL_A, '# Alice unique content');
-    const result = buildContactContext([SENTINEL_A, SENTINEL_A, SENTINEL_A]);
-    const occurrences = result.split('# Alice unique content').length - 1;
-    expect(occurrences).toBe(1);
-  });
-
-  it('truncates any single file longer than MAX_MEMORY_CHARS', () => {
-    const bigContent = 'x'.repeat(MAX_MEMORY_CHARS + 100);
-    writeContactMemory(SENTINEL_A, bigContent);
-    const result = buildContactContext([SENTINEL_A]);
-    expect(result).toContain('[...truncated]');
-  });
-
-  it('skips silently when a JID has no corresponding file', () => {
-    writeContactMemory(SENTINEL_A, '# Alice');
-    const result = buildContactContext([SENTINEL_A, SENTINEL_B]);
-    expect(result).toContain('# Alice');
-    // SENTINEL_B has no file — should not add a placeholder header
-    expect(result).not.toContain(SENTINEL_B);
-  });
-});
+// buildContactContext was removed when the runtime switched to tool-access.
+// Claude now reads contact files itself; we no longer pre-build a block.
