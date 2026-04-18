@@ -168,6 +168,70 @@ export function fillTemplate(template: string, vars: Record<string, string>): st
   return result;
 }
 
+// Bootstrap prompt. Called once per contact during `npm run memory:bootstrap`
+// with the contact's full cross-group message history (up to N per group,
+// stratified) plus Nick's messages in those same groups. Builds a starter
+// memory file from observation — no existing file is assumed.
+export const BOOTSTRAP_PROMPT = `You are building a starter memory file about a single person Nick talks to on WhatsApp. You have Nick's observations from all groups they share. Produce a memory file in the exact format below.
+
+# CONTACT
+
+Display name: {CONTACT_NAME}
+WhatsApp JID: {CONTACT_JID}
+Groups they share with Nick: {GROUPS_LIST}
+Today's date: {TODAY}
+
+# THEIR MESSAGES (sampled across groups)
+
+Each line is formatted as [HH:MM group=<name>] body.
+
+{THEIR_MESSAGES}
+
+# NICK'S MESSAGES IN THOSE GROUPS (for tone/register signal)
+
+{NICK_MESSAGES}
+
+# OUTPUT FORMAT
+
+Output ONLY the memory file, ready to be written to disk. No preamble, no code fences, no explanation. Use this exact structure:
+
+# <Contact name>
+
+## Identity
+- JID: {CONTACT_JID}
+- Groups: <comma-separated group names where they talk with Nick>
+- First seen: {TODAY}
+- Last updated: {TODAY}
+
+## Facts
+- <stable facts observable from messages: where they work, life events, location, relationships they mention>
+
+## Recurring topics
+- <themes they and Nick keep coming back to>
+
+## Open threads
+- <unresolved promises, pending meetings, favors asked that weren't answered>
+- Only include if you can see clear evidence in the messages
+
+## How Nick talks to them
+- <relationship register: jokey / formal / specific slang Nick uses with them / languages mixed>
+- Base this on Nick's messages in the groups they share
+
+## Raw notes
+- <anything else worth remembering that doesn't fit the structured sections above>
+
+# RULES
+
+- Base every entry on observed evidence. Do not invent.
+- If you see strong patterns across many messages, promote them to Facts or Recurring topics.
+- If a potential fact appears only once or twice, keep it in Raw notes.
+- Do not include Nick in the file — this is a profile of the OTHER person.
+- Do not include phone numbers or other PII beyond the JID that's already been specified.
+- Keep the whole file under ~4000 characters. Prefer fewer, higher-confidence entries over long speculative lists.
+- If the messages reveal genuinely nothing about this person (bot-like, one-word replies, automated notifications), output only a minimal Identity section and note in Raw notes: "Not enough content to profile."
+
+Produce the memory file now.`;
+
 // Memory update prompt. Takes the current per-contact memory file (possibly
 // empty), the observed chat exchange, and the bot's generated reply, and
 // returns an updated memory file. The LLM is instructed to preserve facts,

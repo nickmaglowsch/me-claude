@@ -4,16 +4,11 @@ import {
   waitForReady,
   fetchAllChats,
   fetchMessages,
-  formatMessageLine,
   getOwnerId,
 } from './whatsapp';
 import { callClaude } from './claude';
-import { MEMORY_UPDATE_PROMPT, fillTemplate } from './prompts';
-import {
-  writeContactMemory,
-  readContactMemory,
-  isCusJid,
-} from './memory';
+import { BOOTSTRAP_PROMPT, fillTemplate } from './prompts';
+import { writeContactMemory, readContactMemory, isCusJid } from './memory';
 
 // CLI flag parser — simple, no dep. Supports "--key=value" and "--key value".
 function parseFlag(name: string, defaultValue: number): number {
@@ -31,13 +26,38 @@ function parseFlag(name: string, defaultValue: number): number {
   return defaultValue;
 }
 
+// Per-group sample of one contact's messages. We stratify across groups when
+// building the final prompt so a contact who talks in 3 groups gets a balanced
+// cross-section, not just the most-active group's chatter.
+interface GroupSample {
+  groupName: string;
+  theirMessages: Array<{ ts: number; body: string; hh: string }>;
+  nickMessages: Array<{ ts: number; body: string; hh: string }>;
+}
+
+// Aggregate state: one entry per canonical @c.us JID, with samples from every
+// group we've seen them in.
+interface ContactAggregate {
+  cusJid: string;
+  name: string;
+  groups: Map<string, GroupSample>; // key: chat name
+  totalTheirMessages: number;
+}
+
+function formatHM(ts: number): string {
+  const d = new Date(ts * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 async function main(): Promise<void> {
   const topKChats = parseFlag('top-k-chats', 10);
   const minMessagesFromThem = parseFlag('min-messages-from-them', 3);
   const minMessagesFromNick = parseFlag('min-messages-from-nick', 3);
+  const perContactPerGroupCap = parseFlag('per-contact-per-group', 40);
+  const perContactTotalCap = parseFlag('per-contact-total', 150);
 
   console.log(
-    `Bootstrap config: top-k-chats=${topKChats}, min-messages-from-them=${minMessagesFromThem}, min-messages-from-nick=${minMessagesFromNick}`,
+    `Bootstrap config: top-k-chats=${topKChats} min-theirs=${minMessagesFromThem} min-nicks=${minMessagesFromNick} per-group-cap=${perContactPerGroupCap} total-cap=${perContactTotalCap}`,
   );
 
   const client = createClient();
@@ -50,13 +70,10 @@ async function main(): Promise<void> {
 
   console.log('Fetching all chats...');
   const chats = await fetchAllChats(client);
-  // We only bootstrap from group chats — per the design doc, v1 scope is
-  // groups only. DM-derived memory is deferred.
   const groupChats = chats.filter((c: { isGroup?: boolean }) => c.isGroup);
   console.log(`Found ${groupChats.length} group chats.`);
 
-  // Score each group by how many messages Nick sent in it (activity proxy).
-  // We'll only bootstrap from the top K.
+  // Score each group by how many messages Nick sent. Take top K most-active.
   const scored: Array<{ chat: any; score: number }> = [];
   for (const chat of groupChats) {
     try {
@@ -69,14 +86,18 @@ async function main(): Promise<void> {
   }
   scored.sort((a, b) => b.score - a.score);
   const topChats = scored.slice(0, topKChats);
-  console.log(`Bootstrapping from top ${topChats.length} most-active groups.`);
+  console.log(`Walking top ${topChats.length} most-active groups to aggregate contacts...`);
 
-  let contactsProcessed = 0;
-  let contactsWritten = 0;
-  let contactsSkipped = 0;
+  // Phase 1: aggregate messages per contact across ALL top-K groups.
+  const aggregate = new Map<string, ContactAggregate>();
 
   for (const { chat, score } of topChats) {
-    console.log(`\n[group] "${chat.name}" (${score} of Nick's messages)`);
+    console.log(`\n[aggregate] "${chat.name}" (Nick's messages: ${score})`);
+    if (score < minMessagesFromNick) {
+      console.log(`  skip group: Nick only sent ${score} messages here (<${minMessagesFromNick})`);
+      continue;
+    }
+
     let msgs: any[];
     try {
       msgs = await fetchMessages(chat, 500);
@@ -85,8 +106,9 @@ async function main(): Promise<void> {
       continue;
     }
 
-    // Group messages by author JID. Drop Nick's own messages from the
-    // per-author bucket (Nick isn't a "contact" — he's the owner).
+    const nickMsgs = msgs.filter((m: any) => m.fromMe);
+
+    // Group messages by author (excluding Nick).
     const byAuthor = new Map<string, any[]>();
     for (const m of msgs) {
       const author = m.author ?? m.from;
@@ -95,108 +117,127 @@ async function main(): Promise<void> {
       byAuthor.get(author)!.push(m);
     }
 
-    // Count how many messages Nick sent in this specific chat — same for all
-    // authors here, but the bootstrap prompt benefits from knowing Nick talks
-    // in this group.
-    const nickMsgsInChat = msgs.filter((m: any) => m.fromMe).length;
-    if (nickMsgsInChat < minMessagesFromNick) {
-      console.log(`  skip: Nick only sent ${nickMsgsInChat} messages here (<${minMessagesFromNick})`);
-      continue;
-    }
-
     for (const [authorJid, authorMsgs] of byAuthor) {
-      contactsProcessed++;
-      if (authorMsgs.length < minMessagesFromThem) {
-        console.log(`  skip ${authorJid}: only ${authorMsgs.length} messages (<${minMessagesFromThem})`);
-        contactsSkipped++;
-        continue;
-      }
-
-      // Canonical key: resolve via the Contact object, which always yields
-      // the @c.us form regardless of whether `msg.author` was @lid or @c.us.
-      // This is more reliable than walking `chat.participants` because the
-      // participants list sometimes doesn't expose the `lid` field.
-      let contactName = 'Unknown';
+      // Canonical @c.us via Contact object. More reliable than walking
+      // chat.participants because pushname + number come back either way.
+      let name = 'Unknown';
       let cusJid: string | null = null;
       try {
         const contact = await authorMsgs[0].getContact();
-        contactName = contact.pushname || contact.number || authorJid;
-        const contactId = contact.id?._serialized;
-        if (contactId && isCusJid(contactId)) {
-          cusJid = contactId;
-        }
-      } catch (err) {
-        console.log(`  skip ${authorJid}: getContact failed: ${(err as Error).message.split('\n')[0]}`);
-        contactsSkipped++;
-        continue;
+        name = contact.pushname || contact.number || authorJid;
+        const id = contact.id?._serialized;
+        if (id && isCusJid(id)) cusJid = id;
+      } catch {
+        /* skip */
       }
+      if (!cusJid) continue;
 
-      if (!cusJid) {
-        console.log(`  skip ${authorJid}: could not resolve to @c.us (contactName=${contactName})`);
-        contactsSkipped++;
-        continue;
+      // Take the last N of their messages in this group, chronologically.
+      const sampleOfTheirs = authorMsgs
+        .slice(-perContactPerGroupCap)
+        .map((m: any) => ({ ts: m.timestamp, body: m.body as string, hh: formatHM(m.timestamp) }));
+      // Take the last N/3 of Nick's messages as tone signal.
+      const sampleOfNicks = nickMsgs
+        .slice(-Math.max(10, Math.floor(perContactPerGroupCap / 3)))
+        .map((m: any) => ({ ts: m.timestamp, body: m.body as string, hh: formatHM(m.timestamp) }));
+
+      if (!aggregate.has(cusJid)) {
+        aggregate.set(cusJid, {
+          cusJid,
+          name,
+          groups: new Map(),
+          totalTheirMessages: 0,
+        });
       }
-
-      // Skip if we already have a file — bootstrap is intentionally
-      // non-destructive. Running it twice is safe.
-      if (readContactMemory(cusJid)) {
-        console.log(`  skip ${cusJid}: file already exists`);
-        contactsSkipped++;
-        continue;
-      }
-
-      // Messages from this contact (most recent 20)
-      const theirRecent = authorMsgs.slice(-20);
-      // Nick's messages interleaved by time — take the last ~10 Nick sent
-      // in this chat as the "reply" context
-      const nickRecent = msgs.filter((m: any) => m.fromMe).slice(-10);
-
-      const theirLines = await Promise.all(
-        theirRecent.map(async (m: any) => {
-          try {
-            const c = await m.getContact();
-            return formatMessageLine(m, c.pushname || c.number || 'them');
-          } catch {
-            return formatMessageLine(m, 'them');
-          }
-        }),
-      );
-      const nickLines = nickRecent.map((m: any) => formatMessageLine(m, 'Nick'));
-
-      const today = new Date().toISOString().slice(0, 10);
-      // Reuse MEMORY_UPDATE_PROMPT with synthetic fields — BEFORE=their history,
-      // MENTION=most-recent message from them, AFTER=Nick's recent replies,
-      // NICK_REPLY=Nick's most recent reply in this chat.
-      const prompt = fillTemplate(MEMORY_UPDATE_PROMPT, {
-        CURRENT_MEMORY: '(no file yet)',
-        CONTACT_NAME: contactName,
-        CONTACT_JID: cusJid,
-        BEFORE_MESSAGES: theirLines.slice(0, -1).join('\n') || '(no messages)',
-        MENTION_MESSAGE: theirLines[theirLines.length - 1] ?? '(no recent message)',
-        AFTER_MESSAGES: nickLines.slice(0, -1).join('\n') || '(no messages)',
-        NICK_REPLY: nickLines[nickLines.length - 1] ?? '(no recent reply)',
-        TODAY: today,
+      const entry = aggregate.get(cusJid)!;
+      // Prefer pushname over number if we pick up a better name later.
+      if (name && name !== 'Unknown' && entry.name === 'Unknown') entry.name = name;
+      entry.groups.set(chat.name as string, {
+        groupName: chat.name as string,
+        theirMessages: sampleOfTheirs,
+        nickMessages: sampleOfNicks,
       });
+      entry.totalTheirMessages += authorMsgs.length;
+    }
+  }
 
-      try {
-        const updated = (await callClaude(prompt)).trim();
-        if (updated) {
-          writeContactMemory(cusJid, updated);
-          console.log(`  wrote ${cusJid} "${contactName}" (${updated.length} chars)`);
-          contactsWritten++;
-        } else {
-          console.warn(`  empty output for ${cusJid} — skipping`);
-          contactsSkipped++;
-        }
-      } catch (err) {
-        console.warn(`  claude failed for ${cusJid}: ${(err as Error).message.split('\n')[0]}`);
-        contactsSkipped++;
+  console.log(`\nAggregated ${aggregate.size} unique contacts across all groups.`);
+
+  // Phase 2: build + write memory file per contact.
+  let written = 0;
+  let skippedTooFew = 0;
+  let skippedFileExists = 0;
+  let skippedClaudeEmpty = 0;
+  let skippedClaudeErr = 0;
+
+  // Order contacts by total-message-count desc so if we hit API limits the
+  // most valuable files land first.
+  const ordered = [...aggregate.values()].sort((a, b) => b.totalTheirMessages - a.totalTheirMessages);
+
+  for (const entry of ordered) {
+    if (entry.totalTheirMessages < minMessagesFromThem) {
+      skippedTooFew++;
+      continue;
+    }
+    if (readContactMemory(entry.cusJid)) {
+      console.log(`  skip ${entry.cusJid} "${entry.name}": file already exists`);
+      skippedFileExists++;
+      continue;
+    }
+
+    // Stratified sample across their groups — interleave so the prompt sees
+    // all their groups represented, not the first one taking the whole budget.
+    const theirPool: Array<{ ts: number; body: string; hh: string; group: string }> = [];
+    const nickPool: Array<{ ts: number; body: string; hh: string; group: string }> = [];
+    for (const [gName, sample] of entry.groups) {
+      for (const m of sample.theirMessages) theirPool.push({ ...m, group: gName });
+      for (const m of sample.nickMessages) nickPool.push({ ...m, group: gName });
+    }
+    theirPool.sort((a, b) => a.ts - b.ts);
+    nickPool.sort((a, b) => a.ts - b.ts);
+
+    // Cap total messages sent to claude
+    const theirsCapped = theirPool.slice(-perContactTotalCap);
+    const nicksCapped = nickPool.slice(-Math.floor(perContactTotalCap / 3));
+
+    const theirLines = theirsCapped
+      .map(m => `[${m.hh} group=${m.group}] ${m.body}`)
+      .join('\n') || '(no messages)';
+    const nickLines = nicksCapped
+      .map(m => `[${m.hh} group=${m.group}] ${m.body}`)
+      .join('\n') || '(no messages)';
+    const groupsList = [...entry.groups.keys()].join(', ');
+    const today = new Date().toISOString().slice(0, 10);
+
+    const prompt = fillTemplate(BOOTSTRAP_PROMPT, {
+      CONTACT_NAME: entry.name,
+      CONTACT_JID: entry.cusJid,
+      GROUPS_LIST: groupsList,
+      TODAY: today,
+      THEIR_MESSAGES: theirLines,
+      NICK_MESSAGES: nickLines,
+    });
+
+    try {
+      const output = (await callClaude(prompt)).trim();
+      if (!output) {
+        console.warn(`  empty output for ${entry.cusJid} "${entry.name}" — skipping`);
+        skippedClaudeEmpty++;
+        continue;
       }
+      writeContactMemory(entry.cusJid, output);
+      console.log(
+        `  wrote ${entry.cusJid} "${entry.name}" — ${entry.groups.size} group(s), ${entry.totalTheirMessages} of their msgs, ${output.length} chars`,
+      );
+      written++;
+    } catch (err) {
+      console.warn(`  claude failed for ${entry.cusJid} "${entry.name}": ${(err as Error).message.split('\n')[0]}`);
+      skippedClaudeErr++;
     }
   }
 
   console.log(
-    `\nBootstrap complete. Processed: ${contactsProcessed}, written: ${contactsWritten}, skipped: ${contactsSkipped}`,
+    `\nBootstrap complete. Written: ${written}. Skipped: ${skippedTooFew} too few msgs + ${skippedFileExists} file existed + ${skippedClaudeEmpty} claude returned empty + ${skippedClaudeErr} claude errored.`,
   );
   console.log('Review files in data/contacts/ before running npm start.');
   await client.destroy();
