@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-ai-bot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "setup": "tsx src/setup.ts",
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "qrcode-terminal": "latest",
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "latest",
+    "typescript": "^5.0.0",
+    "vitest": "latest"
+  }
+}
