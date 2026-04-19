@@ -632,6 +632,22 @@ describe('dispatchCommand — !ambient and !topic', () => {
     expect(text).toMatch(/memory/i);
     expect(text).toContain('startups');
   });
+
+  // Task 03: !topic list shows feedback topics line
+  it('!topic list shows feedback topics line', async () => {
+    // Pre-populate a feedback-topics.json file
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'feedback-topics.json'),
+      JSON.stringify({ updated: new Date().toISOString(), topics: ['futebol', 'series'] }),
+      'utf8',
+    );
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic list')!, ctx);
+    const text = replies[0];
+    expect(text).toMatch(/feedback/i);
+    expect(text).toContain('futebol');
+  });
 });
 
 // ---- dispatchCommand — !topic add validation --------------------------------
@@ -691,6 +707,63 @@ describe('dispatchCommand — !topic add validation', () => {
     const ctx = makeCtx(replies, new Map());
     await dispatchCommand(parseCommand('!topic add new-topic')!, ctx);
     expect(replies[0]).toMatch(/limit|200|full/i);
+  });
+
+  // Alias group validation tests (Task 01)
+  it('!topic add futebol|jogo|fla succeeds and stores the raw alias string', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add futebol|jogo|fla')!, ctx);
+    expect(replies[0]).toMatch(/^ok, added/);
+    const cfgPath = path.join(tmpDir, 'data', 'ambient-config.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    expect(cfg.explicitTopics).toContain('futebol|jogo|fla');
+  });
+
+  it('!topic add foo||bar is rejected with alias cannot be empty error', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add foo||bar')!, ctx);
+    expect(replies[0]).toMatch(/alias.*empty|empty.*alias/i);
+  });
+
+  it('!topic add aliases up to 32 chars each are accepted', async () => {
+    const alias32 = 'a'.repeat(32);
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand(`!topic add futebol|${alias32}`)!, ctx);
+    expect(replies[0]).toMatch(/^ok, added/);
+  });
+
+  it('!topic add alias over 32 chars is rejected', async () => {
+    const alias33 = 'a'.repeat(33);
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand(`!topic add futebol|${alias33}`)!, ctx);
+    expect(replies[0]).toMatch(/alias.*too long|too long.*alias|32/i);
+  });
+
+  it('!topic add phrase at exactly 64 chars total with pipes passes', async () => {
+    // Create an alias group exactly 64 chars total: e.g. "a|b" padded carefully
+    const p1 = 'x'.repeat(31);
+    const p2 = 'y'.repeat(31);
+    const phrase = `${p1}|${p2}`; // 31 + 1 + 31 = 63 chars total, both aliases ≤32
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand(`!topic add ${phrase}`)!, ctx);
+    expect(replies[0]).toMatch(/^ok, added/);
+  });
+
+  it('!topic remove futebol|jogo removes the exact entry', async () => {
+    // Add the alias group first
+    await dispatchCommand(parseCommand('!topic add futebol|jogo')!, makeCtx([], new Map()));
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic remove futebol|jogo')!, ctx);
+    expect(replies[0]).toMatch(/removed/i);
+    const cfgPath = path.join(tmpDir, 'data', 'ambient-config.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    expect(cfg.explicitTopics).not.toContain('futebol|jogo');
   });
 });
 

@@ -191,6 +191,8 @@ When you do reply, do NOT acknowledge that you weren't mentioned. Do not say "fa
 
 export const VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT = `You will receive Nick's voice profile — an analysis of how he writes on WhatsApp. Extract a concise list of TOPICS OR INTERESTS he talks about or clearly cares about. The output is a fuzzy-match bank — optimize for recall, not precision. One topic per line. Lowercase. No bullets, no numbering, no explanation. Maximum 20 lines.
 
+When a topic has common synonyms or aliases (e.g. "futebol" is also called "jogo" or "bola"), emit them as a pipe-separated alias group on a single line: topic|alias1|alias2. Use aliases only when they are genuinely distinct surface forms for the same concept. If there are no meaningful aliases, emit a single word.
+
 Include:
 - Named interests (sports he follows, hobbies, places he visits, technologies he uses)
 - Work/domain topics
@@ -205,7 +207,25 @@ Do NOT include:
 
 {VOICE_PROFILE}
 
-# OUTPUT (one topic per line, max 20, lowercase)`;
+# OUTPUT (one topic per line or alias group, max 20, lowercase)`;
+
+export const AMBIENT_CLASSIFIER_PROMPT = `You are deciding whether a WhatsApp message is related to any of the topics in a bank. Answer with ONLY one of these two formats — no explanation, no punctuation, nothing else:
+
+  topic:<exact-bank-entry>
+
+OR
+
+  none
+
+Use topic:<name> if the message is clearly about that topic (even if the wording is indirect or colloquial). Use none if the message is not meaningfully related to any topic.
+
+<topic_bank>
+{TOPIC_BANK}
+</topic_bank>
+
+<message>
+{MESSAGE}
+</message>`;
 
 export const SUMMARY_PROMPT = `You will see messages from a WhatsApp group chat on a specific date. Produce a concise summary for Nick (the bot owner) who wants to catch up on what was discussed.
 

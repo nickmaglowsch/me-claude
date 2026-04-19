@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fillTemplate, META_PROMPT, RUNTIME_PROMPT } from './prompts';
+import { fillTemplate, META_PROMPT, RUNTIME_PROMPT, VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, AMBIENT_CLASSIFIER_PROMPT } from './prompts';
 
 describe('fillTemplate', () => {
   it('single substitution', () => {
@@ -136,6 +136,33 @@ describe('fillTemplate', () => {
   it('key with backslash does not corrupt output', () => {
     const key = 'KEY\\SLASH';
     expect(fillTemplate(`{${key}}`, { [key]: 'result' })).toBe('result');
+  });
+});
+
+describe('AMBIENT_CLASSIFIER_PROMPT (Task 02)', () => {
+  it('AMBIENT_CLASSIFIER_PROMPT contains XML delimiters', () => {
+    // Must fence user-controlled content (message body) to prevent injection
+    expect(AMBIENT_CLASSIFIER_PROMPT).toMatch(/<[a-z_]+>/);
+    expect(AMBIENT_CLASSIFIER_PROMPT).toMatch(/<\/[a-z_]+>/);
+  });
+
+  it('AMBIENT_CLASSIFIER_PROMPT asks for topic:<name> or none format', () => {
+    expect(AMBIENT_CLASSIFIER_PROMPT).toMatch(/topic:/i);
+    expect(AMBIENT_CLASSIFIER_PROMPT).toMatch(/none/i);
+  });
+
+  it('AMBIENT_CLASSIFIER_PROMPT includes {MESSAGE} and {TOPIC_BANK} placeholders', () => {
+    expect(AMBIENT_CLASSIFIER_PROMPT).toContain('{MESSAGE}');
+    expect(AMBIENT_CLASSIFIER_PROMPT).toContain('{TOPIC_BANK}');
+  });
+});
+
+describe('VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT alias-group format (Task 01)', () => {
+  it('VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT mentions the alias-group format', () => {
+    // The prompt must instruct Claude to emit "topic|alias1|alias2" lines for synonyms
+    expect(VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT).toMatch(/\|/);
+    // Should mention alias or synonym concept
+    expect(VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT).toMatch(/alias|synonym/i);
   });
 });
 
