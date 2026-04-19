@@ -14,6 +14,7 @@ import { resolveToCus } from './memory';
 import { logEvent } from './events';
 import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
 import { ensureGroupFolder, persistMessage, localDate } from './groups';
+import { selectBurstWindow, extractQuotedAnchor, type ContextMessage } from './context';
 import {
   loadAmbientConfig,
   saveAmbientConfig,
@@ -29,6 +30,17 @@ import {
 const lastReplyAt = new Map<string, number>();
 const RATE_LIMIT_MS = 10_000;  // 1 reply per group per 10 seconds
 const AFTER_WAIT_MS = 8_000;   // wait before replying (to collect after-messages)
+
+// Context-window tuning. A "burst" is a run of messages with no gap larger
+// than BURST_GAP_SEC — we include everything in the current burst up to the
+// caps below. See src/context.ts.
+const BURST_GAP_SEC = 5 * 60;   // 5 minutes — typical pause between threads
+const MAX_BEFORE = 15;          // ceiling even if burst is longer
+const MAX_AFTER = 10;
+const MIN_BEFORE = 3;           // floor — even in a quiet chat, give Claude
+                                // the 3 most recent pre-trigger messages so
+                                // it isn't replying blind after a long silence
+const FETCH_POOL_LIMIT = 40;    // how many raw messages to fetch per side
 
 // Silence map: chat-name → muted-until-ms; "*" key for global mute.
 // Managed by the !silence / !resume commands.
@@ -191,6 +203,11 @@ async function main(): Promise<void> {
         return;
       }
 
+      // Archive folder for this group. Computed once per handler invocation
+      // and reused by both the persist block and the prompt vars below.
+      // ensureGroupFolder is a no-op disk read after the group is registered.
+      const groupFolder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
+
       // Archive every group message for summary/search. Errors are swallowed
       // inside persistMessage; no gating here.
       // Skip system messages that have no conversational content.
@@ -205,7 +222,6 @@ async function main(): Promise<void> {
       ]);
       if (!SYSTEM_TYPES.has(msg.type)) {
         try {
-          const folder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
           const contact = msg.fromMe
             ? undefined
             : await msg.getContact().catch(() => undefined);
@@ -233,7 +249,7 @@ async function main(): Promise<void> {
             },
           });
           logEvent({ kind: 'group.persisted', chat_id: chat.id._serialized, chat: chat.name, msg_type: msg.type });
-          dbg(`persisted to ${folder}/${localDate(tsMs)}`);
+          dbg(`persisted to ${groupFolder}/${localDate(tsMs)}`);
         } catch (e) {
           dbg(`persist error: ${(e as Error).message}`);
         }
@@ -249,17 +265,24 @@ async function main(): Promise<void> {
       // Log every group message received with mention info so we can see the raw shape
       dbg(`msg in [${chat.name}]: body="${(msg.body || '').slice(0, 60)}" mentionedIds=${JSON.stringify(msg.mentionedIds)} hasQuoted=${msg.hasQuotedMsg}`);
 
+      // Resolve the quoted message ONCE — both trigger detection and the
+      // anchor-block builder below need it, and every call is a round-trip
+      // through whatsapp-web.js/puppeteer.
+      let quotedMsg: any = null;
+      if (msg.hasQuotedMsg) {
+        try {
+          quotedMsg = await msg.getQuotedMessage();
+        } catch (e) {
+          dbg(`getQuotedMessage failed: ${(e as Error).message}`);
+        }
+      }
+
       // Gate 3: we must be mentioned OR they must be replying to one of our messages
       let trigger: 'mention' | 'reply' | 'ambient' | null = null;
       if (isMentioned(msg.mentionedIds, ownerIds)) {
         trigger = 'mention';
-      } else if (msg.hasQuotedMsg) {
-        try {
-          const quoted = await msg.getQuotedMessage();
-          if (quoted?.fromMe) trigger = 'reply';
-        } catch (e) {
-          dbg(`getQuotedMessage failed: ${(e as Error).message}`);
-        }
+      } else if (quotedMsg?.fromMe) {
+        trigger = 'reply';
       }
       // Silence check: global mute ("*") or per-chat mute.
       // Runs BEFORE the ambient gate so silenced chats never reach topic-bank
@@ -326,20 +349,55 @@ async function main(): Promise<void> {
       }
       recordReply(lastReplyAt, groupJid, nowMs);
 
-      // Fetch BEFORE context: last 11 messages, exclude the mention itself
-      const beforeFetch = await chat.fetchMessages({ limit: 11 });
-      const beforeMessages = beforeFetch
-        .filter((m: any) => m.id._serialized !== msg.id._serialized)
-        .slice(-10); // up to 10, most recent
+      // Fetch a generous pool for BEFORE context; we'll trim it to a burst
+      // window in memory so quiet chats get what they have and active bursts
+      // get fewer messages from unrelated parallel threads.
+      const beforeFetch = await chat.fetchMessages({ limit: FETCH_POOL_LIMIT });
 
       // Wait 8 seconds for possible "after" messages
       await sleep(AFTER_WAIT_MS);
 
-      // Fetch AFTER context: messages that arrived after the mention's timestamp
-      const afterFetch = await chat.fetchMessages({ limit: 20 });
-      const afterMessages = afterFetch
-        .filter((m: any) => m.timestamp > msg.timestamp && m.id._serialized !== msg.id._serialized)
-        .slice(0, 10); // up to 10
+      // Re-fetch after the wait to pick up AFTER-messages. We merge with the
+      // BEFORE pool rather than filtering by timestamp so a single sorted pass
+      // can do both the before and after burst trim.
+      const afterFetch = await chat.fetchMessages({ limit: FETCH_POOL_LIMIT });
+      const rawPool: any[] = [...beforeFetch, ...afterFetch];
+
+      // Shape raw whatsapp-web.js messages into the ContextMessage interface.
+      // We keep a back-reference (`_raw`) so the downstream formatter can call
+      // getContact() / access hasQuotedMsg on the real object.
+      const toCtxMsg = (m: any): ContextMessage & { _raw: any } => ({
+        id: m.id._serialized,
+        timestamp: m.timestamp,
+        body: m.body ?? '',
+        _raw: m,
+      });
+      const triggerCtx = toCtxMsg(msg);
+      const poolCtx = rawPool.map(toCtxMsg);
+
+      const { before, after } = selectBurstWindow(poolCtx, triggerCtx, {
+        burstGapSec: BURST_GAP_SEC,
+        maxBefore: MAX_BEFORE,
+        maxAfter: MAX_AFTER,
+        minBefore: MIN_BEFORE,
+      });
+
+      // If the mention is a reply to an older message that fell outside the
+      // burst window, surface it as a separate QUOTED block. Reuses the
+      // quotedMsg resolved above so we don't round-trip to puppeteer twice.
+      //
+      // Self-quote guard: if WA returns the trigger itself as its own quoted
+      // message (edge case we've seen with forwarded/edited messages), skip —
+      // duplicating MENTION into QUOTED would be worse than dropping it.
+      let quotedAnchorRaw: any = null;
+      if (quotedMsg && quotedMsg.id?._serialized !== msg.id?._serialized) {
+        const windowIds = new Set<string>([
+          ...before.map(m => m.id),
+          ...after.map(m => m.id),
+        ]);
+        const anchor = extractQuotedAnchor(toCtxMsg(quotedMsg), { windowIds });
+        if (anchor) quotedAnchorRaw = (anchor as any)._raw;
+      }
 
       // Helper: format a message line (requires resolving sender name)
       const formatLine = async (m: any): Promise<string> => {
@@ -359,10 +417,25 @@ async function main(): Promise<void> {
           ? mentionContact.id._serialized
           : resolveToCus(rawSenderJid, chat);
 
-      // Format all message lines
-      const beforeLines = await Promise.all(beforeMessages.map(formatLine));
-      const afterLines = await Promise.all(afterMessages.map(formatLine));
+      // Format all message lines using the back-referenced raw messages.
+      const beforeLines = await Promise.all(
+        before.map(m => formatLine((m as any)._raw))
+      );
+      const afterLines = await Promise.all(
+        after.map(m => formatLine((m as any)._raw))
+      );
       const mentionLine = formatMessageLine(msg, mentionSenderName);
+      const quotedLine = quotedAnchorRaw ? await formatLine(quotedAnchorRaw) : null;
+
+      logEvent({
+        kind: 'context.window',
+        chat: chat.name,
+        chat_id: groupJid,
+        before_count: before.length,
+        after_count: after.length,
+        has_quoted_anchor: !!quotedLine,
+        burst_gap_sec: BURST_GAP_SEC,
+      });
 
       // Build prompt vars. Memory file read/write is now Claude's job via
       // Read/Edit/Write tools — we only hand it the sender's canonical JID
@@ -373,9 +446,13 @@ async function main(): Promise<void> {
         SENDER_NAME: mentionSenderName,
         SENDER_JID: senderCus ?? rawSenderJid ?? 'unknown',
         TODAY: today,
+        QUOTED_BLOCK: quotedLine
+          ? `QUOTED (older message being replied to):\n${quotedLine}\n\n`
+          : '',
         BEFORE_MESSAGES: beforeLines.length > 0 ? beforeLines.join('\n') : '(no messages before)',
         MENTION_MESSAGE: mentionLine,
         AFTER_MESSAGES: afterLines.length > 0 ? afterLines.join('\n') : '(no messages after yet)',
+        GROUP_FOLDER: groupFolder,
       };
       dbg(`handing off to claude w/ tools; sender=${vars.SENDER_JID}`);
 
