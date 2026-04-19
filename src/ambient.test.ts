@@ -12,6 +12,8 @@ import {
   shouldAmbientReply,
   recordAmbientReply,
   extractVoiceProfileTopics,
+  refineAmbientDecision,
+  _haikuImpl,
   AMBIENT_CONFIG_PATH,
   AmbientConfig,
 } from './ambient';
@@ -556,5 +558,319 @@ describe('loadAmbientConfig schema validation', () => {
     expect(cfg.explicitTopics.every(t => t === maxPhrase)).toBe(true);
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+// ---- loadMemoryTopics extended section scanning (Task 01) --------------------
+
+describe('loadMemoryTopics extended sections', () => {
+  it('pulls from ## Open threads in addition to ## Recurring topics', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'contacts', 'alice@c.us.md'),
+      [
+        '# Alice',
+        '',
+        '## Recurring topics',
+        '- tennis',
+        '',
+        '## Open threads',
+        '- planning a trip to lisbon',
+        '',
+        '## Facts',
+        '- works at a startup in são paulo',
+      ].join('\n'),
+      'utf8',
+    );
+    const topics = loadMemoryTopics();
+    expect(topics).toContain('tennis');
+    expect(topics).toContain('planning a trip to lisbon');
+  });
+
+  it('pulls from ## Facts bullets (truncated to first 6 words)', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'contacts', 'bob@c.us.md'),
+      [
+        '# Bob',
+        '',
+        '## Facts',
+        '- loves hiking in the mountains on weekends every summer',
+      ].join('\n'),
+      'utf8',
+    );
+    const topics = loadMemoryTopics();
+    // Full sentence should be truncated to first 6 words
+    expect(topics).toContain('loves hiking in the mountains on');
+    // The full line should NOT appear
+    expect(topics).not.toContain('loves hiking in the mountains on weekends every summer');
+  });
+
+  it('Facts bullets are truncated to first 6 words', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'contacts', 'charlie@c.us.md'),
+      [
+        '# Charlie',
+        '',
+        '## Facts',
+        '- one two three four five six seven eight',
+      ].join('\n'),
+      'utf8',
+    );
+    const topics = loadMemoryTopics();
+    expect(topics).toContain('one two three four five six');
+    expect(topics).not.toContain('one two three four five six seven eight');
+  });
+
+  it('dedupes topics across all sections', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'contacts', 'dave@c.us.md'),
+      [
+        '# Dave',
+        '',
+        '## Recurring topics',
+        '- tennis',
+        '',
+        '## Open threads',
+        '- tennis',
+        '',
+        '## Facts',
+        '- tennis player since childhood',
+      ].join('\n'),
+      'utf8',
+    );
+    const topics = loadMemoryTopics();
+    // "tennis" from recurring topics and open threads dedups to one
+    expect(topics.filter(t => t === 'tennis')).toHaveLength(1);
+    // Facts truncation: "tennis player since childhood" is only 4 words, kept as-is (under 6)
+    expect(topics).toContain('tennis player since childhood');
+  });
+});
+
+// ---- buildTopicBank includes feedback topics (Task 01/03 integration) --------
+
+describe('buildTopicBank includes feedback topics', () => {
+  it('includes feedbackTopics when passed explicitly', () => {
+    const cfg: AmbientConfig = {
+      ...defaultAmbientConfig(),
+      explicitTopics: ['a'],
+      voiceProfileTopics: ['b'],
+    };
+    const bank = buildTopicBank(cfg, ['c'], ['d']);
+    expect(bank).toContain('a');
+    expect(bank).toContain('b');
+    expect(bank).toContain('c');
+    expect(bank).toContain('d');
+  });
+
+  it('duplicate across sources (e.g. voice + feedback) is deduped', () => {
+    const cfg: AmbientConfig = {
+      ...defaultAmbientConfig(),
+      explicitTopics: ['tennis'],
+      voiceProfileTopics: ['tennis'],
+    };
+    const bank = buildTopicBank(cfg, [], ['tennis']);
+    expect(bank.filter(t => t === 'tennis')).toHaveLength(1);
+  });
+});
+
+// ---- refineAmbientDecision (Task 02 — Haiku fallback classifier) -------------
+
+describe('refineAmbientDecision', () => {
+  const bank = ['futebol', 'tennis', 'startups'];
+  const baseCfg: AmbientConfig = {
+    ...defaultAmbientConfig(),
+    masterEnabled: true,
+    confidenceThreshold: 0.5,
+  };
+
+  let originalHaikuImpl: (prompt: string) => Promise<string>;
+
+  beforeEach(() => {
+    originalHaikuImpl = _haikuImpl.fn;
+  });
+
+  afterEach(() => {
+    _haikuImpl.fn = originalHaikuImpl;
+  });
+
+  // Helper to build a failed ambient decision as refineAmbientDecision expects
+  function failedDecision(reason = 'no fuzzy match') {
+    return { pass: false as const, reason };
+  }
+
+  it('haiku returns topic:<x> → decision passes with matchedTopic=x', async () => {
+    // Override the haiku impl to return "topic:futebol"
+    _haikuImpl.fn = async (_prompt: string) => 'topic:futebol';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'jogo do Fla ontem',
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(true);
+    expect(result.reason).toBe('haiku classifier');
+    expect(result.matchedTopic).toBe('futebol');
+  });
+
+  it('haiku returns none → decision stays failed', async () => {
+    _haikuImpl.fn = async (_prompt: string) => 'none';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'some unrelated message',
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(false);
+  });
+
+  it('top score below 0.35 → haiku is NOT called (fallback band gate)', async () => {
+    let called = false;
+    _haikuImpl.fn = async (_prompt: string) => { called = true; return 'topic:futebol'; };
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.3,  // below 0.35
+      messageBody: 'test',
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    expect(called).toBe(false);
+    expect(result.pass).toBe(false);
+  });
+
+  it('second identical body → haiku is called only once (cache hit)', async () => {
+    let callCount = 0;
+    _haikuImpl.fn = async (_prompt: string) => { callCount++; return 'topic:tennis'; };
+    const params = {
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'unique body for cache test ' + Date.now(),
+      topicBank: bank,
+      cfg: baseCfg,
+    };
+    await refineAmbientDecision(params);
+    await refineAmbientDecision(params);
+    expect(callCount).toBe(1);
+  });
+
+  it('haiku returns topic not in bank → treated as none, warn logged', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    _haikuImpl.fn = async (_prompt: string) => 'topic:notinbank';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'something about topic not in bank',
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(false);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('haiku throws → decision returned with reason=haiku:error, error logged', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    _haikuImpl.fn = async (_prompt: string) => { throw new Error('haiku error'); };
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision('no fuzzy match'),
+      topScore: 0.4,
+      messageBody: 'test error path ' + Date.now(),
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(false);
+    expect(result.reason).toBe('haiku:error');
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('haiku errors are NOT cached — subsequent call with same body re-invokes haiku', async () => {
+    let callCount = 0;
+    _haikuImpl.fn = async (_prompt: string) => {
+      callCount++;
+      throw new Error('transient');
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const params = {
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'transient failure body ' + Date.now(),
+      topicBank: bank,
+      cfg: baseCfg,
+    };
+    await refineAmbientDecision(params);
+    await refineAmbientDecision(params);
+    expect(callCount).toBe(2);
+    warnSpy.mockRestore();
+  });
+
+  it('haiku returns a single alias of an alias-group → resolves to full bank entry', async () => {
+    // Bank entry has `|`-separated aliases. Haiku may return any one alias.
+    const aliasBank = ['futebol|jogo|fla|brasileirão'];
+    _haikuImpl.fn = async (_prompt: string) => 'topic:fla';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'assistiu o jogo ontem?',
+      topicBank: aliasBank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(true);
+    expect(result.reason).toBe('haiku classifier');
+    // Matched topic is the full bank entry, not just the returned alias.
+    expect(result.matchedTopic).toBe('futebol|jogo|fla|brasileirão');
+  });
+
+  it('haiku returns the full bank entry verbatim → still accepted', async () => {
+    const aliasBank = ['futebol|jogo|fla'];
+    _haikuImpl.fn = async (_prompt: string) => 'topic:futebol|jogo|fla';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'bora jogar bola',
+      topicBank: aliasBank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(true);
+    expect(result.matchedTopic).toBe('futebol|jogo|fla');
+  });
+
+  it('cache key is based on NORMALIZED body — case and punctuation variants hit same entry', async () => {
+    let callCount = 0;
+    _haikuImpl.fn = async (_prompt: string) => {
+      callCount++;
+      return 'topic:futebol';
+    };
+    const common = { originalDecision: failedDecision(), topScore: 0.4, topicBank: bank, cfg: baseCfg };
+    // First call: establishes the cache entry.
+    await refineAmbientDecision({ ...common, messageBody: 'normalized cache test ' + Date.now() });
+    const firstCount = callCount;
+    // Second call with the SAME normalized form (different casing + punctuation)
+    // should hit the cache.
+    const firstBody = 'normalized cache test abc';
+    const variantBody = '  Normalized, Cache TEST abc!!  ';
+    await refineAmbientDecision({ ...common, messageBody: firstBody });
+    const countAfterFirst = callCount;
+    await refineAmbientDecision({ ...common, messageBody: variantBody });
+    expect(callCount).toBe(countAfterFirst); // no extra call
+    expect(firstCount).toBeGreaterThan(0);
+  });
+
+  it('message body is truncated to 2000 chars before being passed to haiku', async () => {
+    let capturedPrompt = '';
+    _haikuImpl.fn = async (prompt: string) => { capturedPrompt = prompt; return 'none'; };
+    const longBody = 'x'.repeat(3000);
+    await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: longBody,
+      topicBank: bank,
+      cfg: baseCfg,
+    });
+    // The prompt should contain at most 2000 chars of the body
+    const bodyOccurrence = capturedPrompt.indexOf('x'.repeat(2001));
+    expect(bodyOccurrence).toBe(-1);
+    // But should contain 2000 x's
+    expect(capturedPrompt).toContain('x'.repeat(2000));
   });
 });

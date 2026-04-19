@@ -85,13 +85,48 @@ export interface FuzzyMatch {
   score: number;       // 0-1
 }
 
-// Best fuzzy match of any token in `bank` against any word in `body`.
-// Also compares each topic against the full normalized body.
-// Returns the top-scoring match with score >= threshold, or null.
-export function bestFuzzyMatch(
+// Returns the best score for a single bank entry against the body, ignoring threshold.
+// Each bank entry may be an alias group (e.g. "futebol|tenis|basquete"); each alias
+// is scored independently and the best wins.
+// Returns { topic, matchedWord, score } using the *full bank entry string* as topic.
+function scoreBankEntry(
+  entry: string,
+  bodyWords: string[],
+  normalizedBody: string,
+): FuzzyMatch | null {
+  // Split on | to get individual aliases; skip empty aliases.
+  const aliases = entry.split('|').filter(a => a.length > 0);
+  if (!aliases.length) return null;
+
+  let best: FuzzyMatch | null = null;
+
+  for (const alias of aliases) {
+    const normalizedAlias = normalize(alias);
+
+    // Compare alias against each word in body.
+    for (const word of bodyWords) {
+      const score = diceSimilarity(normalizedAlias, word);
+      if (best === null || score > best.score) {
+        best = { topic: entry, matchedWord: word, score };
+      }
+    }
+
+    // Also compare alias against the full normalized body.
+    const fullScore = diceSimilarity(normalizedAlias, normalizedBody);
+    if (best === null || fullScore > best.score) {
+      best = { topic: entry, matchedWord: normalizedBody, score: fullScore };
+    }
+  }
+
+  return best;
+}
+
+// scoreFuzzy: returns the top-scoring bank entry match regardless of threshold.
+// Returns null only when bank is empty or body has no words.
+export function scoreFuzzy(
   body: string,
   bank: string[],
-  threshold: number,
+  _threshold?: number,
 ): FuzzyMatch | null {
   if (!bank.length) return null;
   const trimmedBody = body.trim();
@@ -102,23 +137,27 @@ export function bestFuzzyMatch(
 
   let best: FuzzyMatch | null = null;
 
-  for (const topic of bank) {
-    const normalizedTopic = normalize(topic);
-
-    // Compare topic against each word in body.
-    for (const word of bodyWords) {
-      const score = diceSimilarity(normalizedTopic, word);
-      if (score >= threshold && (best === null || score > best.score)) {
-        best = { topic, matchedWord: word, score };
-      }
-    }
-
-    // Also compare topic against the full normalized body.
-    const fullScore = diceSimilarity(normalizedTopic, normalizedBody);
-    if (fullScore >= threshold && (best === null || fullScore > best.score)) {
-      best = { topic, matchedWord: normalizedBody, score: fullScore };
+  for (const entry of bank) {
+    const candidate = scoreBankEntry(entry, bodyWords, normalizedBody);
+    if (candidate && (best === null || candidate.score > best.score)) {
+      best = candidate;
     }
   }
 
   return best;
+}
+
+// Best fuzzy match of any token in `bank` against any word in `body`.
+// Also compares each topic against the full normalized body.
+// Returns the top-scoring match with score >= threshold, or null.
+// Each bank entry may be an alias group (e.g. "futebol|tenis|basquete").
+export function bestFuzzyMatch(
+  body: string,
+  bank: string[],
+  threshold: number,
+): FuzzyMatch | null {
+  const top = scoreFuzzy(body, bank);
+  if (!top) return null;
+  if (top.score < threshold) return null;
+  return top;
 }

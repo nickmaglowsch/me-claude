@@ -26,8 +26,11 @@ import {
   loadMemoryTopics,
   shouldAmbientReply,
   recordAmbientReply,
+  refineAmbientDecision,
   type AmbientDecision,
 } from './ambient';
+import { scoreFuzzy } from './fuzzy';
+import { maybeRefreshFeedbackTopics } from './feedback-topics';
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
@@ -153,6 +156,18 @@ async function main(): Promise<void> {
   }
   const voiceProfile = fs.readFileSync(profilePath, 'utf8');
   console.log('Voice profile loaded.');
+
+  // Refresh feedback topics on startup (non-blocking, errors are swallowed).
+  try {
+    const startupCfg = loadAmbientConfig();
+    const startupBank = buildTopicBank(startupCfg, loadMemoryTopics(), []);
+    const fbResult = maybeRefreshFeedbackTopics(startupBank);
+    if (fbResult.refreshed) {
+      console.log(`[feedback] refreshed: ${fbResult.count} topics extracted`);
+    }
+  } catch (e) {
+    console.warn('[feedback] maybeRefreshFeedbackTopics error on startup:', (e as Error).message);
+  }
 
   const DEBUG = process.env.BOT_DEBUG === '1';
   const dbg = (...args: unknown[]): void => { if (DEBUG) console.log('[debug]', ...args); };
@@ -318,12 +333,31 @@ async function main(): Promise<void> {
         try {
           const cfg = ensureDailyReset(loadAmbientConfig());
           const topicBank = buildTopicBank(cfg, loadMemoryTopics());
+          const body = msg.body || '';
           ambientDecision = shouldAmbientReply({
             cfg,
             chatName: chat.name,
-            messageBody: msg.body || '',
+            messageBody: body,
             topicBank,
           });
+
+          // If the sync gate failed with a fuzzy miss, ask Haiku to refine.
+          // refineAmbientDecision returns one of: haiku classifier (pass),
+          // haiku:none, or haiku:error — the reason field is the source of
+          // truth for downstream logging.
+          if (!ambientDecision.pass && ambientDecision.reason === 'no fuzzy match') {
+            const topScore = scoreFuzzy(body, topicBank)?.score ?? 0;
+            ambientDecision = await refineAmbientDecision({
+              originalDecision: ambientDecision,
+              topScore,
+              messageBody: body,
+              topicBank,
+              cfg,
+            }).catch((e: Error) => {
+              dbg(`refineAmbientDecision threw: ${e.message}`);
+              return { pass: false, reason: 'haiku:error' } as AmbientDecision;
+            });
+          }
         } catch (e) {
           dbg(`ambient gate threw: ${(e as Error).message}`);
         }
@@ -339,15 +373,16 @@ async function main(): Promise<void> {
           return;
         }
 
-        // Ambient triggered
+        // Ambient triggered (bigram gate pass OR haiku classifier pass)
         trigger = 'ambient';
-        dbg(`ambient triggered: matchedTopic=${ambientDecision.matchedTopic} score=${ambientDecision.score}`);
+        dbg(`ambient triggered: matchedTopic=${ambientDecision.matchedTopic} score=${ambientDecision.score} reason=${ambientDecision.reason}`);
         logEvent({
           kind: 'ambient.considered',
           chat: chat.name,
           chat_id: chat.id._serialized,
           matchedTopic: ambientDecision.matchedTopic,
           score: ambientDecision.score,
+          source: ambientDecision.reason === 'haiku classifier' ? 'haiku' : 'fuzzy',
         });
       }
 

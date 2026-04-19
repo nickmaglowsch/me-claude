@@ -12,6 +12,7 @@ import {
   loadMemoryTopics,
   maybeRefreshVoiceProfileTopics,
 } from './ambient';
+import { loadFeedbackTopics } from './feedback-topics';
 import { findGroupsByName, readDayMessages, localDate } from './groups';
 import { callClaude } from './claude';
 import { SUMMARY_PROMPT, fillTemplate } from './prompts';
@@ -468,10 +469,24 @@ async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
       await ctx.reply('usage: !topic add <phrase>');
       return;
     }
-    // Length cap
+    // Length cap (applies to the whole phrase including any | separators)
     if (phrase.length > 64) {
       await ctx.reply(`phrase too long (${phrase.length} chars). Max 64.`);
       return;
+    }
+    // Alias group validation: if phrase contains |, validate each alias
+    if (phrase.includes('|')) {
+      const aliases = phrase.split('|');
+      for (const alias of aliases) {
+        if (alias.length === 0) {
+          await ctx.reply('alias cannot be empty (found consecutive | or leading/trailing |).');
+          return;
+        }
+        if (alias.length > 32) {
+          await ctx.reply(`alias "${alias}" is too long (${alias.length} chars). Each alias max 32 chars.`);
+          return;
+        }
+      }
     }
     // Bank size cap
     if (cfg.explicitTopics.length >= 200) {
@@ -510,10 +525,12 @@ async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
 
   if (sub === 'list') {
     const memoryTopics = loadMemoryTopics();
+    const feedbackTopics = loadFeedbackTopics();
     const lines = [
       `topics (explicit, ${cfg.explicitTopics.length}): ${cfg.explicitTopics.join(', ') || '(none)'}`,
       `topics (voice, ${cfg.voiceProfileTopics.length}): ${cfg.voiceProfileTopics.join(', ') || '(none)'}`,
       `topics (memory, ${memoryTopics.length}): ${memoryTopics.join(', ') || '(none)'}`,
+      `topics (feedback, ${feedbackTopics.length}): ${feedbackTopics.join(', ') || '(none)'}`,
     ];
     await ctx.reply(lines.join('\n'));
     return;

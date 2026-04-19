@@ -1,12 +1,25 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { callClaude, callClaudeWithTools, _config } from './claude';
 
 describe('callClaude', () => {
+  let originalCommand: string;
+  let originalArgs: string[];
+  let originalTimeoutMs: number;
+
   beforeEach(() => {
     // Reset to default between tests
+    originalCommand = _config.command;
+    originalArgs = [..._config.args];
+    originalTimeoutMs = _config.timeoutMs;
     _config.command = 'node';
     _config.args = [];
     _config.timeoutMs = 60000;
+  });
+
+  afterEach(() => {
+    _config.command = originalCommand;
+    _config.args = originalArgs;
+    _config.timeoutMs = originalTimeoutMs;
   });
 
   it('success: resolves with stdin-echoed content', async () => {
@@ -24,6 +37,47 @@ describe('callClaude', () => {
     _config.args = ['-e', 'setTimeout(() => {}, 999999);'];
     _config.timeoutMs = 100;
     await expect(callClaude('test')).rejects.toThrow('timed out');
+  });
+
+  // Task 02: model option
+  it('callClaude passes --model <name> when model option is provided', async () => {
+    // Use a script file so extra args (--model ...) land in process.argv, not node flags
+    const os = await import('os');
+    const fsm = await import('fs');
+    const pathm = await import('path');
+    const scriptPath = pathm.join(os.tmpdir(), 'claude-model-test.mjs');
+    fsm.writeFileSync(
+      scriptPath,
+      "process.stdin.resume(); process.stdin.on('data', () => process.stdout.write(process.argv.join(' ')));\n",
+      'utf8',
+    );
+    _config.args = [scriptPath];
+    try {
+      const result = await callClaude('test', { model: 'claude-haiku-4-5' });
+      expect(result).toContain('--model');
+      expect(result).toContain('claude-haiku-4-5');
+    } finally {
+      fsm.unlinkSync(scriptPath);
+    }
+  });
+
+  it('callClaude uses no --model flag when no model option is provided', async () => {
+    const os = await import('os');
+    const fsm = await import('fs');
+    const pathm = await import('path');
+    const scriptPath = pathm.join(os.tmpdir(), 'claude-nomodel-test.mjs');
+    fsm.writeFileSync(
+      scriptPath,
+      "process.stdin.resume(); process.stdin.on('data', () => process.stdout.write(process.argv.join(' ')));\n",
+      'utf8',
+    );
+    _config.args = [scriptPath];
+    try {
+      const result = await callClaude('test');
+      expect(result).not.toContain('--model');
+    } finally {
+      fsm.unlinkSync(scriptPath);
+    }
   });
 });
 

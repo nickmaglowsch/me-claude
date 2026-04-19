@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { atomicWriteFile } from './atomic';
-import { bestFuzzyMatch } from './fuzzy';
+import { bestFuzzyMatch, scoreFuzzy, normalize } from './fuzzy';
 import { callClaude } from './claude';
-import { VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, fillTemplate } from './prompts';
+import { VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, AMBIENT_CLASSIFIER_PROMPT, fillTemplate } from './prompts';
+import { loadFeedbackTopics } from './feedback-topics';
 
 export const AMBIENT_CONFIG_PATH = 'data/ambient-config.json';
 
@@ -112,16 +114,16 @@ export function ensureDailyReset(cfg: AmbientConfig): AmbientConfig {
   return { ...cfg, repliesToday: [], lastReset: today };
 }
 
-// Parse the "## Recurring topics" section from a single markdown file's content.
-// Returns lowercased topic strings from bullet lines in that section.
-function parseRecurringTopics(content: string): string[] {
+// Parse a named section from a single markdown file's content.
+// Returns raw (trimmed) bullet text from that section.
+// isFacts: if true, bullet text is truncated to the first 6 words.
+function parseSectionBullets(content: string, sectionPattern: RegExp, isFacts = false): string[] {
   const topics: string[] = [];
   const lines = content.split('\n');
   let inSection = false;
 
   for (const line of lines) {
-    // Detect the section header (## Recurring topics, case-insensitive).
-    if (/^##\s+recurring topics\s*$/i.test(line.trim())) {
+    if (sectionPattern.test(line.trim())) {
       inSection = true;
       continue;
     }
@@ -129,13 +131,20 @@ function parseRecurringTopics(content: string): string[] {
     if (inSection) {
       // Any new ## heading ends the section.
       if (/^##/.test(line)) {
-        break;
+        inSection = false;
+        continue;
       }
       // Bullet lines: "- topic text"
       const match = line.match(/^[-*]\s+(.+)$/);
       if (match) {
-        const topic = match[1].trim().toLowerCase();
-        if (topic) topics.push(topic);
+        let text = match[1].trim().toLowerCase();
+        if (!text) continue;
+        if (isFacts) {
+          // Truncate to first 6 words.
+          const words = text.split(/\s+/);
+          text = words.slice(0, 6).join(' ');
+        }
+        if (text) topics.push(text);
       }
     }
   }
@@ -143,7 +152,8 @@ function parseRecurringTopics(content: string): string[] {
   return topics;
 }
 
-// Read all data/contacts/*.md, parse "## Recurring topics" sections.
+// Read all data/contacts/*.md, parse ## Recurring topics, ## Open threads, and ## Facts.
+// Facts bullets are truncated to their first 6 words.
 // Returns deduped, lowercased topics.
 export function loadMemoryTopics(): string[] {
   const contactsDir = path.join(process.cwd(), 'data', 'contacts');
@@ -158,15 +168,25 @@ export function loadMemoryTopics(): string[] {
   const seen = new Set<string>();
   const topics: string[] = [];
 
+  function addTopic(t: string): void {
+    if (t && !seen.has(t)) {
+      seen.add(t);
+      topics.push(t);
+    }
+  }
+
   for (const file of files) {
     const filePath = path.join(contactsDir, file);
     try {
       const content = fs.readFileSync(filePath, 'utf8');
-      for (const topic of parseRecurringTopics(content)) {
-        if (!seen.has(topic)) {
-          seen.add(topic);
-          topics.push(topic);
-        }
+      for (const t of parseSectionBullets(content, /^##\s+recurring topics\s*$/i)) {
+        addTopic(t);
+      }
+      for (const t of parseSectionBullets(content, /^##\s+open threads\s*$/i)) {
+        addTopic(t);
+      }
+      for (const t of parseSectionBullets(content, /^##\s+facts\s*$/i, true)) {
+        addTopic(t);
       }
     } catch {
       // Skip unreadable files.
@@ -176,15 +196,20 @@ export function loadMemoryTopics(): string[] {
   return topics;
 }
 
-// Builds the merged topic bank from: explicit + voice-profile-topics + memory-topics.
-// Caller can pass an already-loaded memory-topics list (for tests / callers that
-// already have memory topics loaded to avoid double I/O).
-export function buildTopicBank(cfg: AmbientConfig, memoryTopics?: string[]): string[] {
+// Builds the merged topic bank from: explicit + voice-profile-topics + memory-topics + feedback-topics.
+// Caller can pass already-loaded topic lists (for tests / callers that already have them loaded
+// to avoid double I/O). When not passed, each list is loaded lazily.
+export function buildTopicBank(
+  cfg: AmbientConfig,
+  memoryTopics?: string[],
+  feedbackTopics?: string[],
+): string[] {
   const resolved = memoryTopics ?? loadMemoryTopics();
+  const feedback = feedbackTopics ?? loadFeedbackTopics();
   const seen = new Set<string>();
   const bank: string[] = [];
 
-  for (const topic of [...cfg.explicitTopics, ...cfg.voiceProfileTopics, ...resolved]) {
+  for (const topic of [...cfg.explicitTopics, ...cfg.voiceProfileTopics, ...resolved, ...feedback]) {
     const t = topic.toLowerCase().trim();
     if (t && !seen.has(t)) {
       seen.add(t);
@@ -340,4 +365,109 @@ export async function maybeRefreshVoiceProfileTopics(): Promise<{
   };
   saveAmbientConfig(updated);
   return { refreshed: true, count: topics.length };
+}
+
+// ---------------------------------------------------------------------------
+// Haiku fallback classifier (Task 02)
+// ---------------------------------------------------------------------------
+
+// LRU cache: sha256(normalizedBody) → AmbientDecision
+// Max 500 entries; evict oldest on overflow.
+const HAIKU_CACHE_MAX = 500;
+const haikuCache = new Map<string, AmbientDecision>();
+
+// Dependency-injection seam — tests can replace `.fn` to avoid spawning a
+// real subprocess. Intentionally a plain object so the reference is stable
+// across module reloads.
+export const _haikuImpl: { fn: (prompt: string) => Promise<string> } = {
+  fn: (prompt: string) => callClaude(prompt, { model: 'claude-haiku-4-5-20251001' }),
+};
+
+const HAIKU_SCORE_FLOOR = 0.35;
+
+export interface RefineParams {
+  originalDecision: AmbientDecision;
+  topScore: number;
+  messageBody: string;
+  topicBank: string[];
+  cfg: AmbientConfig;
+}
+
+// Called after shouldAmbientReply returned { pass: false, reason: 'no fuzzy match' }
+// when the top bigram score is still within the ambiguous band (>= 0.35).
+// Asks Haiku to classify semantically. Caches by sha256 of normalized body.
+//
+// Returns one of three decision shapes:
+//   - pass: true,  reason: 'haiku classifier' — Haiku confirmed a match
+//   - pass: false, reason: 'haiku:none'       — Haiku said no / unparseable
+//   - pass: false, reason: 'haiku:error'      — Haiku threw / timed out (not cached)
+// Callers can distinguish these to log the skipped reason accurately.
+export async function refineAmbientDecision(params: RefineParams): Promise<AmbientDecision> {
+  const { originalDecision, topScore, messageBody, topicBank } = params;
+
+  // Only refine fuzzy-miss decisions.
+  if (originalDecision.reason !== 'no fuzzy match') return originalDecision;
+
+  // Below floor: signal is too weak, don't bother Haiku.
+  if (topScore < HAIKU_SCORE_FLOOR) return originalDecision;
+
+  // Cap body to 2000 chars.
+  const cappedBody = messageBody.slice(0, 2000);
+
+  // Cache lookup keyed on the NORMALIZED body so "Futebol!!" and "futebol"
+  // (and whitespace / diacritic variants) hit the same cache entry.
+  const normalizedBody = normalize(cappedBody);
+  const cacheKey = crypto.createHash('sha256').update(normalizedBody).digest('hex');
+  const cached = haikuCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  // Build the prompt.
+  const prompt = fillTemplate(AMBIENT_CLASSIFIER_PROMPT, {
+    TOPIC_BANK: topicBank.join('\n'),
+    MESSAGE: cappedBody,
+  });
+
+  let rawOutput: string;
+  try {
+    rawOutput = await _haikuImpl.fn(prompt);
+  } catch (err) {
+    console.warn('[ambient] refineAmbientDecision: haiku failed:', (err as Error).message);
+    // Do NOT cache errors — transient failures should be retried on the next message.
+    return { pass: false, reason: 'haiku:error' };
+  }
+
+  // Parse: "topic:<name>" or "none"
+  const trimmed = rawOutput.trim().toLowerCase();
+  let decision: AmbientDecision;
+
+  if (trimmed === 'none' || trimmed === '') {
+    decision = { pass: false, reason: 'haiku:none' };
+  } else if (trimmed.startsWith('topic:')) {
+    const name = trimmed.slice('topic:'.length).trim();
+    // Match against bank entries with alias-group expansion. Haiku may return
+    // either the full entry "futebol|jogo|bola" or a single alias like "futebol".
+    // Either should resolve to the full bank entry so downstream code sees the
+    // same topic string the user added via !topic add.
+    const matchedEntry = topicBank.find(entry =>
+      entry === name || entry.split('|').some(alias => alias.trim() === name),
+    );
+    if (!matchedEntry) {
+      console.warn(`[ambient] refineAmbientDecision: haiku returned unknown topic "${name}"`);
+      decision = { pass: false, reason: 'haiku:none' };
+    } else {
+      decision = { pass: true, reason: 'haiku classifier', matchedTopic: matchedEntry, score: 0.5 };
+    }
+  } else {
+    // Unparseable — treat as none.
+    decision = { pass: false, reason: 'haiku:none' };
+  }
+
+  // Store in LRU cache with overflow eviction.
+  if (haikuCache.size >= HAIKU_CACHE_MAX) {
+    const oldest = haikuCache.keys().next().value;
+    if (oldest !== undefined) haikuCache.delete(oldest);
+  }
+  haikuCache.set(cacheKey, decision);
+
+  return decision;
 }

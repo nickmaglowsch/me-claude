@@ -61,8 +61,15 @@ function runClaude(
 
 // Plain prompt → response. No tools. Used by setup and bootstrap where
 // we want a deterministic text-in / text-out transformation.
-export async function callClaude(prompt: string): Promise<string> {
-  return runClaude(prompt, [], _config.timeoutMs, undefined, 'no-tools');
+export async function callClaude(
+  prompt: string,
+  opts?: { model?: string },
+): Promise<string> {
+  const extraArgs: string[] = [];
+  if (opts?.model) {
+    extraArgs.push('--model', opts.model);
+  }
+  return runClaude(prompt, extraArgs, _config.timeoutMs, undefined, 'no-tools');
 }
 
 // Prompt → response with tool access enabled. Claude may Read, Edit, Write,
