@@ -19,6 +19,7 @@ import {
   setDefaultLimit,
   setGroupLimit,
   getEffectiveLimit,
+  normalizeChatKey as normalizeLimitsKey,
 } from './limits';
 import { loadFeedbackTopics } from './feedback-topics';
 import { findGroupsByName, readDayMessages, localDate } from './groups';
@@ -595,7 +596,12 @@ async function cmdLimit(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
             ...countEntries.map(([g, c]) => {
               const lim = getEffectiveLimit(cfg, g);
               const limStr = lim === null ? '∞' : String(lim);
-              return `  ${g}: ${c}/${limStr}`;
+              const source = Object.prototype.hasOwnProperty.call(cfg.perGroup, g)
+                ? ' (override)'
+                : lim === null
+                ? ''
+                : ' (default)';
+              return `  ${g}: ${c}/${limStr}${source}`;
             }),
           ];
     await ctx.reply([defaultLine, ...overrideLines, ...countLines].join('\n'));
@@ -612,7 +618,7 @@ async function cmdLimit(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
     }
     const updated = setGroupLimit(cfg, groupArg, null);
     saveLimitsConfig(updated);
-    await ctx.reply(`ok, cleared per-group limit for ${groupArg.toLowerCase().trim()}`);
+    await ctx.reply(`ok, cleared per-group limit for ${normalizeLimitsKey(groupArg)}`);
     return;
   }
 
@@ -632,7 +638,7 @@ async function cmdLimit(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
 
   const updated = setGroupLimit(cfg, groupArg, n);
   saveLimitsConfig(updated);
-  await ctx.reply(`ok, limit for ${groupArg.toLowerCase().trim()} set to ${n}/day`);
+  await ctx.reply(`ok, limit for ${normalizeLimitsKey(groupArg)} set to ${n}/day`);
 }
 
 // ---------------------------------------------------------------------------

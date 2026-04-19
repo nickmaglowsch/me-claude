@@ -22,7 +22,7 @@ function todayString(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function normalizeChatKey(s: string): string {
+export function normalizeChatKey(s: string): string {
   return s.trim().toLowerCase();
 }
 
@@ -39,19 +39,26 @@ function resolvedConfigPath(): string {
   return path.join(process.cwd(), LIMITS_CONFIG_PATH);
 }
 
-function isRecordOfNumbers(obj: unknown): obj is Record<string, number> {
+// Limits must be non-negative integers. `typeof === 'number'` alone would
+// admit -1, 1.5, NaN, Infinity from a hand-edited config — the first would
+// silently turn into a global kill switch (current < -1 is never true).
+function isNonNegInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+function isRecordOfNonNegInts(obj: unknown): obj is Record<string, number> {
   if (typeof obj !== 'object' || obj === null) return false;
-  return Object.values(obj as Record<string, unknown>).every(v => typeof v === 'number');
+  return Object.values(obj as Record<string, unknown>).every(isNonNegInt);
 }
 
 function isValidLimitsConfig(obj: unknown): obj is LimitsConfig {
   if (typeof obj !== 'object' || obj === null) return false;
   const c = obj as Record<string, unknown>;
-  const defaultOk = c.defaultPerGroup === null || typeof c.defaultPerGroup === 'number';
+  const defaultOk = c.defaultPerGroup === null || isNonNegInt(c.defaultPerGroup);
   return (
     defaultOk &&
-    isRecordOfNumbers(c.perGroup) &&
-    isRecordOfNumbers(c.counts) &&
+    isRecordOfNonNegInts(c.perGroup) &&
+    isRecordOfNonNegInts(c.counts) &&
     typeof c.lastReset === 'string'
   );
 }
@@ -103,11 +110,25 @@ export interface AllowDecision {
 }
 
 export function shouldAllowReply(cfg: LimitsConfig, chatKey: string): AllowDecision {
+  return shouldAllowReplyWithPending(cfg, chatKey, 0);
+}
+
+// Same as shouldAllowReply but also takes an in-memory count of reservations
+// for in-flight handlers in this chat. The runtime loads the config at check
+// time and only writes after send, so without this accounting N concurrent
+// handlers can each pass the check against a stale `current` and overshoot
+// the cap by N-1. Callers pass the live reservation count; the decision
+// becomes `current + pending < limit`.
+export function shouldAllowReplyWithPending(
+  cfg: LimitsConfig,
+  chatKey: string,
+  pending: number,
+): AllowDecision {
   const key = normalizeChatKey(chatKey);
   const limit = getEffectiveLimit(cfg, key);
   const current = cfg.counts[key] ?? 0;
   if (limit === null) return { allowed: true, current, limit: null };
-  return { allowed: current < limit, current, limit };
+  return { allowed: current + Math.max(0, pending) < limit, current, limit };
 }
 
 export function recordReply(cfg: LimitsConfig, chatKey: string): LimitsConfig {
@@ -129,6 +150,11 @@ export function setGroupLimit(
   value: number | null,
 ): LimitsConfig {
   const key = normalizeChatKey(chatKey);
+  if (!key) {
+    // Empty key would collide with the "no group arg" path in cmdLimit and
+    // also silently bucket every nameless chat together. Refuse early.
+    throw new Error('setGroupLimit: chatKey must be non-empty after normalization');
+  }
   const nextPerGroup = { ...cfg.perGroup };
   if (value === null) {
     delete nextPerGroup[key];

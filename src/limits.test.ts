@@ -9,9 +9,11 @@ import {
   ensureDailyReset,
   getEffectiveLimit,
   shouldAllowReply,
+  shouldAllowReplyWithPending,
   recordReply,
   setDefaultLimit,
   setGroupLimit,
+  normalizeChatKey,
   LIMITS_CONFIG_PATH,
   type LimitsConfig,
 } from './limits';
@@ -67,6 +69,59 @@ describe('loadLimitsConfig', () => {
     );
     const cfg = loadLimitsConfig();
     expect(cfg.defaultPerGroup).toBeNull();
+  });
+
+  it('rejects a negative defaultPerGroup and falls back to defaults', () => {
+    // A negative limit would silently become a global kill switch
+    // (current < -1 is never true). Must be rejected by the schema.
+    fs.writeFileSync(
+      path.join(tmpDir, LIMITS_CONFIG_PATH),
+      JSON.stringify({ defaultPerGroup: -1, perGroup: {}, counts: {}, lastReset: '2026-04-19' }),
+      'utf8',
+    );
+    const cfg = loadLimitsConfig();
+    expect(cfg.defaultPerGroup).toBeNull();
+  });
+
+  it('rejects a non-integer defaultPerGroup', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, LIMITS_CONFIG_PATH),
+      JSON.stringify({ defaultPerGroup: 1.5, perGroup: {}, counts: {}, lastReset: '2026-04-19' }),
+      'utf8',
+    );
+    expect(loadLimitsConfig().defaultPerGroup).toBeNull();
+  });
+
+  it('rejects NaN / Infinity in defaultPerGroup', () => {
+    // NaN and Infinity serialize to JSON as `null`, so hand-crafted inputs
+    // are what we have to guard against. Write raw JSON that decodes to a
+    // number that fails Number.isInteger.
+    fs.writeFileSync(
+      path.join(tmpDir, LIMITS_CONFIG_PATH),
+      '{"defaultPerGroup": 1e999, "perGroup": {}, "counts": {}, "lastReset": "2026-04-19"}',
+      'utf8',
+    );
+    expect(loadLimitsConfig().defaultPerGroup).toBeNull();
+  });
+
+  it('rejects a negative value inside perGroup', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, LIMITS_CONFIG_PATH),
+      JSON.stringify({ defaultPerGroup: 3, perGroup: { mgz: -5 }, counts: {}, lastReset: '2026-04-19' }),
+      'utf8',
+    );
+    const cfg = loadLimitsConfig();
+    expect(cfg.perGroup).toEqual({});
+    expect(cfg.defaultPerGroup).toBeNull();
+  });
+
+  it('rejects a non-integer value inside counts', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, LIMITS_CONFIG_PATH),
+      JSON.stringify({ defaultPerGroup: 3, perGroup: {}, counts: { mgz: 2.5 }, lastReset: '2026-04-19' }),
+      'utf8',
+    );
+    expect(loadLimitsConfig().counts).toEqual({});
   });
 });
 
@@ -225,6 +280,54 @@ describe('shouldAllowReply', () => {
   });
 });
 
+describe('shouldAllowReplyWithPending', () => {
+  // Covers the concurrency race: if N handlers in the same group all ran
+  // shouldAllowReply before any of them persisted their increment, they'd
+  // each see the same `current` and overshoot the cap by N-1. Callers pass
+  // a live in-memory count of in-flight reservations so the decision becomes
+  // current + pending < limit.
+  const cfg: LimitsConfig = {
+    defaultPerGroup: 3,
+    perGroup: {},
+    counts: { mgz: 1 },
+    lastReset: new Date().toISOString().slice(0, 10),
+  };
+
+  it('allows when current + pending is still under the limit', () => {
+    // current=1, pending=1 → effective=2, limit=3 → allowed
+    expect(shouldAllowReplyWithPending(cfg, 'mgz', 1).allowed).toBe(true);
+  });
+
+  it('blocks when current + pending equals the limit', () => {
+    // current=1, pending=2 → effective=3, limit=3 → blocked
+    expect(shouldAllowReplyWithPending(cfg, 'mgz', 2).allowed).toBe(false);
+  });
+
+  it('blocks when current + pending exceeds the limit', () => {
+    expect(shouldAllowReplyWithPending(cfg, 'mgz', 5).allowed).toBe(false);
+  });
+
+  it('treats negative pending as 0 (defensive)', () => {
+    // A buggy reservation accounting shouldn't enable overshoot.
+    expect(shouldAllowReplyWithPending(cfg, 'mgz', -10).allowed).toBe(true);
+    const atCap: LimitsConfig = { ...cfg, counts: { mgz: 3 } };
+    expect(shouldAllowReplyWithPending(atCap, 'mgz', -10).allowed).toBe(false);
+  });
+
+  it('always allows when limit is null (unlimited)', () => {
+    const unlimited = defaultLimitsConfig();
+    expect(shouldAllowReplyWithPending(unlimited, 'mgz', 999).allowed).toBe(true);
+  });
+
+  it('shouldAllowReply (pending=0 variant) agrees with shouldAllowReplyWithPending', () => {
+    // Regression guard: shouldAllowReply must stay the "pending=0" special case
+    // of shouldAllowReplyWithPending.
+    expect(shouldAllowReply(cfg, 'mgz').allowed).toBe(
+      shouldAllowReplyWithPending(cfg, 'mgz', 0).allowed,
+    );
+  });
+});
+
 describe('recordReply', () => {
   it('increments the count for a chat key', () => {
     const cfg: LimitsConfig = {
@@ -317,5 +420,21 @@ describe('setGroupLimit', () => {
     const cfg = defaultLimitsConfig();
     const next = setGroupLimit(cfg, 'muted', 0);
     expect(next.perGroup.muted).toBe(0);
+  });
+
+  it('throws when the normalized chat key is empty', () => {
+    const cfg = defaultLimitsConfig();
+    expect(() => setGroupLimit(cfg, '', 3)).toThrow(/non-empty/);
+    expect(() => setGroupLimit(cfg, '   ', 3)).toThrow(/non-empty/);
+  });
+});
+
+describe('normalizeChatKey', () => {
+  it('lowercases and trims', () => {
+    expect(normalizeChatKey('  MGZ  ')).toBe('mgz');
+  });
+
+  it('returns "" for whitespace-only input', () => {
+    expect(normalizeChatKey('   ')).toBe('');
   });
 });
