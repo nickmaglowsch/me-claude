@@ -79,20 +79,37 @@ export function getOwnerId(client: Client): string {
   return client.info.wid._serialized;
 }
 
-// Resolve a display name for a message sender without throwing.
-// whatsapp-web.js's getContact() can blow up with
+// Resolve a message sender's display name and canonical @c.us id without
+// throwing. whatsapp-web.js's getContact() can blow up with
 // "getAlternateUserWid - Invalid get call using deviceWid" for certain @lid
 // senders; when that happens we fall back to the digits from author/from so
 // a single bad contact doesn't abort the surrounding Promise.all batch.
-export async function resolveSenderName(msg: any): Promise<string> {
+// `name` is null when nothing usable was found — callers provide their own
+// default (the burst window uses "Unknown", mention path uses "Someone").
+// `cusJid` is non-null only when the contact id is a proper @c.us jid.
+export async function resolveSenderContact(
+  msg: any
+): Promise<{ name: string | null; cusJid: string | null }> {
+  let cusJid: string | null = null;
   try {
-    const contact = await msg.getContact();
-    const name = contact?.pushname || contact?.number;
-    if (name) return name;
+    const contact = await msg?.getContact?.();
+    const serialized = contact?.id?._serialized;
+    if (typeof serialized === 'string' && serialized.endsWith('@c.us')) {
+      cusJid = serialized;
+    }
+    const pushname = typeof contact?.pushname === 'string' ? contact.pushname.trim() : '';
+    const number = typeof contact?.number === 'string' ? contact.number.trim() : '';
+    const name = pushname || number;
+    if (name) return { name, cusJid };
   } catch {
     // fall through to id-based fallback
   }
   const rawId = msg?.author ?? msg?.from ?? '';
   const prefix = String(rawId).split('@')[0];
-  return prefix || 'Unknown';
+  return { name: prefix || null, cusJid };
+}
+
+export async function resolveSenderName(msg: any): Promise<string> {
+  const { name } = await resolveSenderContact(msg);
+  return name || 'Unknown';
 }
