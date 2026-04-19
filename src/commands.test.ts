@@ -991,3 +991,125 @@ describe('dispatchCommand — !summary', () => {
     expect(replies[0]).toMatch(/summary failed/i);
   });
 });
+
+describe('dispatchCommand — !limit', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'commands-test-limit-'));
+    fs.mkdirSync(path.join(tmpDir, 'data'), { recursive: true });
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function runLimit(raw: string, replies: string[]): Promise<void> {
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand(raw)!, ctx);
+  }
+
+  function readLimitsFile(): any {
+    const p = path.join(tmpDir, 'data', 'limits-config.json');
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  }
+
+  it('no args: replies with usage', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit', replies);
+    expect(replies[0]).toMatch(/usage:\s*!limit/i);
+  });
+
+  it('!limit <N>: sets the default per-group limit and persists', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 3', replies);
+    expect(replies[0]).toMatch(/3/);
+    const cfg = readLimitsFile();
+    expect(cfg.defaultPerGroup).toBe(3);
+    expect(cfg.perGroup).toEqual({});
+  });
+
+  it('!limit 0: valid (kill switch default)', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 0', replies);
+    const cfg = readLimitsFile();
+    expect(cfg.defaultPerGroup).toBe(0);
+  });
+
+  it('!limit <N> <group>: sets per-group override only', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 5 mgz', replies);
+    expect(replies[0]).toMatch(/mgz/i);
+    expect(replies[0]).toMatch(/5/);
+    const cfg = readLimitsFile();
+    expect(cfg.perGroup.mgz).toBe(5);
+    expect(cfg.defaultPerGroup).toBeNull();
+  });
+
+  it('!limit <N> <group with spaces>: joins trailing args as the group name', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 2 some long group', replies);
+    const cfg = readLimitsFile();
+    expect(cfg.perGroup['some long group']).toBe(2);
+  });
+
+  it('!limit off: clears the default', async () => {
+    // seed with a default first
+    await runLimit('!limit 3', []);
+    const replies: string[] = [];
+    await runLimit('!limit off', replies);
+    const cfg = readLimitsFile();
+    expect(cfg.defaultPerGroup).toBeNull();
+  });
+
+  it('!limit off <group>: removes per-group override only', async () => {
+    await runLimit('!limit 5 mgz', []);
+    await runLimit('!limit 3', []); // keep default
+    const replies: string[] = [];
+    await runLimit('!limit off mgz', replies);
+    const cfg = readLimitsFile();
+    expect(cfg.perGroup.mgz).toBeUndefined();
+    expect(cfg.defaultPerGroup).toBe(3);
+  });
+
+  it('!limit status: shows defaultPerGroup, per-group overrides, counts', async () => {
+    await runLimit('!limit 3', []);
+    await runLimit('!limit 10 mgz', []);
+    const replies: string[] = [];
+    await runLimit('!limit status', replies);
+    const out = replies[0];
+    expect(out).toMatch(/default/i);
+    expect(out).toMatch(/3/);
+    expect(out).toMatch(/mgz/);
+    expect(out).toMatch(/10/);
+  });
+
+  it('!limit <non-integer>: replies with usage/error', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit abc', replies);
+    expect(replies[0]).toMatch(/invalid|usage/i);
+  });
+
+  it('!limit <negative>: rejects', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit -1', replies);
+    expect(replies[0]).toMatch(/invalid|usage/i);
+  });
+
+  it('!limit <decimal>: rejects', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 1.5', replies);
+    expect(replies[0]).toMatch(/invalid|usage/i);
+  });
+
+  it('normalizes group key case and whitespace', async () => {
+    const replies: string[] = [];
+    await runLimit('!limit 4   MGZ  ', replies);
+    const cfg = readLimitsFile();
+    expect(cfg.perGroup.mgz).toBe(4);
+  });
+});

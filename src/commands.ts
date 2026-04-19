@@ -12,6 +12,14 @@ import {
   loadMemoryTopics,
   maybeRefreshVoiceProfileTopics,
 } from './ambient';
+import {
+  loadLimitsConfig,
+  saveLimitsConfig,
+  ensureDailyReset as ensureLimitsDailyReset,
+  setDefaultLimit,
+  setGroupLimit,
+  getEffectiveLimit,
+} from './limits';
 import { loadFeedbackTopics } from './feedback-topics';
 import { findGroupsByName, readDayMessages, localDate } from './groups';
 import { callClaude } from './claude';
@@ -124,7 +132,10 @@ const HELP_TEXT = `Commands available:
   !ambient status|cap|threshold  — show or change ambient config
   !ambient refresh               — re-extract topics from voice profile + memory
   !topic add|remove|list <phrase> — manage the fuzzy-match topic bank
-  !summary <group> [date]        — Summarize a group's day. date: today | yesterday | Nd | YYYY-MM-DD`;
+  !summary <group> [date]        — Summarize a group's day. date: today | yesterday | Nd | YYYY-MM-DD
+  !limit <N> [group]             — cap replies/ambient per group per day. omit group for default.
+  !limit off [group]             — clear the default (or a per-group override)
+  !limit status                  — show current limits and today's counts`;
 
 // ---------------------------------------------------------------------------
 // Command handlers
@@ -541,6 +552,90 @@ async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
 }
 
 // ---------------------------------------------------------------------------
+// !limit command handler
+// ---------------------------------------------------------------------------
+
+// Parse a non-negative integer string. Rejects "1.5", "-1", "abc", "", etc.
+function parseNonNegativeInt(raw: string): number | null {
+  if (!/^\d+$/.test(raw)) return null;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+async function cmdLimit(parsed: ParsedCommand, ctx: CommandContext): Promise<void> {
+  const first = parsed.argv[0];
+  if (!first) {
+    await ctx.reply(
+      'usage: !limit <N> [group] | !limit off [group] | !limit status',
+    );
+    return;
+  }
+
+  const cfg = ensureLimitsDailyReset(loadLimitsConfig());
+
+  if (first.toLowerCase() === 'status') {
+    const defaultLine =
+      cfg.defaultPerGroup === null
+        ? 'default: unlimited'
+        : `default: ${cfg.defaultPerGroup}/day per group`;
+    const overrides = Object.entries(cfg.perGroup);
+    const overrideLines =
+      overrides.length === 0
+        ? ['per-group overrides: none']
+        : [
+            'per-group overrides:',
+            ...overrides.map(([g, n]) => `  ${g}: ${n}/day`),
+          ];
+    const countEntries = Object.entries(cfg.counts);
+    const countLines =
+      countEntries.length === 0
+        ? ['today\'s counts: none']
+        : [
+            'today\'s counts:',
+            ...countEntries.map(([g, c]) => {
+              const lim = getEffectiveLimit(cfg, g);
+              const limStr = lim === null ? '∞' : String(lim);
+              return `  ${g}: ${c}/${limStr}`;
+            }),
+          ];
+    await ctx.reply([defaultLine, ...overrideLines, ...countLines].join('\n'));
+    return;
+  }
+
+  if (first.toLowerCase() === 'off') {
+    const groupArg = parsed.argv.slice(1).join(' ').trim();
+    if (!groupArg) {
+      const updated = setDefaultLimit(cfg, null);
+      saveLimitsConfig(updated);
+      await ctx.reply('ok, default limit cleared (unlimited)');
+      return;
+    }
+    const updated = setGroupLimit(cfg, groupArg, null);
+    saveLimitsConfig(updated);
+    await ctx.reply(`ok, cleared per-group limit for ${groupArg.toLowerCase().trim()}`);
+    return;
+  }
+
+  const n = parseNonNegativeInt(first);
+  if (n === null) {
+    await ctx.reply('invalid limit: must be a non-negative integer (or use "off" / "status")');
+    return;
+  }
+
+  const groupArg = parsed.argv.slice(1).join(' ').trim();
+  if (!groupArg) {
+    const updated = setDefaultLimit(cfg, n);
+    saveLimitsConfig(updated);
+    await ctx.reply(`ok, default limit set to ${n}/day per group`);
+    return;
+  }
+
+  const updated = setGroupLimit(cfg, groupArg, n);
+  saveLimitsConfig(updated);
+  await ctx.reply(`ok, limit for ${groupArg.toLowerCase().trim()} set to ${n}/day`);
+}
+
+// ---------------------------------------------------------------------------
 // parseDateSpec
 // ---------------------------------------------------------------------------
 
@@ -707,6 +802,9 @@ export async function dispatchCommand(
         break;
       case 'summary':
         await cmdSummary(parsed, ctx);
+        break;
+      case 'limit':
+        await cmdLimit(parsed, ctx);
         break;
       default:
         await ctx.reply(`unknown command: ${parsed.name}. try !help`);

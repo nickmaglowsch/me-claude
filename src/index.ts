@@ -31,6 +31,13 @@ import {
 } from './ambient';
 import { scoreFuzzy } from './fuzzy';
 import { maybeRefreshFeedbackTopics } from './feedback-topics';
+import {
+  loadLimitsConfig,
+  saveLimitsConfig,
+  ensureDailyReset as ensureLimitsDailyReset,
+  shouldAllowReply as shouldAllowReplyLimit,
+  recordReply as recordLimitReply,
+} from './limits';
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
@@ -397,6 +404,27 @@ async function main(): Promise<void> {
       }
       recordReply(lastReplyAt, groupJid, nowMs);
 
+      // Gate 5: per-group daily limit (applies to all triggers).
+      // Check BEFORE burst fetch / Claude call to avoid paying for work we'll drop.
+      // The counter is incremented once a message is actually sent below.
+      const limitsCfg = ensureLimitsDailyReset(loadLimitsConfig());
+      const limitDecision = shouldAllowReplyLimit(limitsCfg, chat.name);
+      if (!limitDecision.allowed) {
+        console.log(
+          `[${trigger}] skipped: group limit reached in [${chat.name}] ` +
+          `(${limitDecision.current}/${limitDecision.limit})`,
+        );
+        logEvent({
+          kind: 'skip.group_limit',
+          chat: chat.name,
+          chat_id: groupJid,
+          trigger,
+          current: limitDecision.current,
+          limit: limitDecision.limit,
+        });
+        return;
+      }
+
       // Fetch a generous pool for BEFORE context; we'll trim it to a burst
       // window in memory so quiet chats get what they have and active bursts
       // get fewer messages from unrelated parallel threads.
@@ -558,6 +586,15 @@ async function main(): Promise<void> {
         const cfgAfter = recordAmbientReply(ensureDailyReset(loadAmbientConfig()));
         saveAmbientConfig(cfgAfter);
         logEvent({ kind: 'ambient.replied', chat: chat.name, trigger: 'ambient' });
+      }
+
+      // Per-group daily counter — ticks on every sent reply regardless of trigger.
+      // Reload + reset to avoid stomping updates from other sends in this tick.
+      try {
+        const freshLimits = ensureLimitsDailyReset(loadLimitsConfig());
+        saveLimitsConfig(recordLimitReply(freshLimits, chat.name));
+      } catch (e) {
+        console.warn('[limits] failed to record reply:', (e as Error).message);
       }
 
       // Log the handled mention
