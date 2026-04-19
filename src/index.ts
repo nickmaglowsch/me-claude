@@ -7,6 +7,8 @@ import {
   getOwnerName,
   getOwnerId,
   formatMessageLine,
+  resolveSenderName,
+  resolveSenderContact,
 } from './whatsapp';
 import { callClaudeWithTools } from './claude';
 import { RUNTIME_PROMPT, AMBIENT_PROMPT_PREFIX, fillTemplate } from './prompts';
@@ -410,25 +412,23 @@ async function main(): Promise<void> {
         if (anchor) quotedAnchorRaw = (anchor as any)._raw;
       }
 
-      // Helper: format a message line (requires resolving sender name)
+      // Helper: format a message line. Sender resolution is fault-tolerant
+      // so one @lid contact that trips whatsapp-web.js's getAlternateUserWid
+      // bug doesn't reject the whole Promise.all window below. sanitizePushname
+      // strips newlines/backticks so a hostile display name can't inject into
+      // the BEFORE/AFTER blocks of the Claude prompt.
       const formatLine = async (m: any): Promise<string> => {
-        const contact = await m.getContact();
-        const senderName = contact.pushname || contact.number || 'Unknown';
+        const senderName = sanitizePushname(await resolveSenderName(m));
         return formatMessageLine(m, senderName);
       };
 
       // Format mention sender. Prefer the Contact object's @c.us id for the
       // memory key — it's the canonical form Claude will use when Read/Edit'ing
       // data/contacts/<jid>.md, regardless of whether msg.author was @lid.
-      const mentionContact = await msg.getContact();
-      const mentionSenderName = sanitizePushname(
-        mentionContact.pushname || mentionContact.number || 'Someone'
-      );
+      const mentionResolved = await resolveSenderContact(msg);
+      const mentionSenderName = sanitizePushname(mentionResolved.name || 'Someone');
       const rawSenderJid = msg.author ?? msg.from;
-      const senderCus =
-        mentionContact.id?._serialized && mentionContact.id._serialized.endsWith('@c.us')
-          ? mentionContact.id._serialized
-          : resolveToCus(rawSenderJid, chat);
+      const senderCus = mentionResolved.cusJid ?? resolveToCus(rawSenderJid, chat);
 
       // Format all message lines using the back-referenced raw messages.
       const beforeLines = await Promise.all(
