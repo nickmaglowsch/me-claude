@@ -768,21 +768,92 @@ describe('refineAmbientDecision', () => {
     warnSpy.mockRestore();
   });
 
-  it('haiku throws → original decision returned, error logged', async () => {
+  it('haiku throws → decision returned with reason=haiku:error, error logged', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     _haikuImpl.fn = async (_prompt: string) => { throw new Error('haiku error'); };
-    const original = failedDecision('no fuzzy match');
     const result = await refineAmbientDecision({
-      originalDecision: original,
+      originalDecision: failedDecision('no fuzzy match'),
       topScore: 0.4,
-      messageBody: 'test error path',
+      messageBody: 'test error path ' + Date.now(),
       topicBank: bank,
       cfg: baseCfg,
     });
     expect(result.pass).toBe(false);
-    expect(result.reason).toBe('no fuzzy match');
+    expect(result.reason).toBe('haiku:error');
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+
+  it('haiku errors are NOT cached — subsequent call with same body re-invokes haiku', async () => {
+    let callCount = 0;
+    _haikuImpl.fn = async (_prompt: string) => {
+      callCount++;
+      throw new Error('transient');
+    };
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const params = {
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'transient failure body ' + Date.now(),
+      topicBank: bank,
+      cfg: baseCfg,
+    };
+    await refineAmbientDecision(params);
+    await refineAmbientDecision(params);
+    expect(callCount).toBe(2);
+    warnSpy.mockRestore();
+  });
+
+  it('haiku returns a single alias of an alias-group → resolves to full bank entry', async () => {
+    // Bank entry has `|`-separated aliases. Haiku may return any one alias.
+    const aliasBank = ['futebol|jogo|fla|brasileirão'];
+    _haikuImpl.fn = async (_prompt: string) => 'topic:fla';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'assistiu o jogo ontem?',
+      topicBank: aliasBank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(true);
+    expect(result.reason).toBe('haiku classifier');
+    // Matched topic is the full bank entry, not just the returned alias.
+    expect(result.matchedTopic).toBe('futebol|jogo|fla|brasileirão');
+  });
+
+  it('haiku returns the full bank entry verbatim → still accepted', async () => {
+    const aliasBank = ['futebol|jogo|fla'];
+    _haikuImpl.fn = async (_prompt: string) => 'topic:futebol|jogo|fla';
+    const result = await refineAmbientDecision({
+      originalDecision: failedDecision(),
+      topScore: 0.4,
+      messageBody: 'bora jogar bola',
+      topicBank: aliasBank,
+      cfg: baseCfg,
+    });
+    expect(result.pass).toBe(true);
+    expect(result.matchedTopic).toBe('futebol|jogo|fla');
+  });
+
+  it('cache key is based on NORMALIZED body — case and punctuation variants hit same entry', async () => {
+    let callCount = 0;
+    _haikuImpl.fn = async (_prompt: string) => {
+      callCount++;
+      return 'topic:futebol';
+    };
+    const common = { originalDecision: failedDecision(), topScore: 0.4, topicBank: bank, cfg: baseCfg };
+    // First call: establishes the cache entry.
+    await refineAmbientDecision({ ...common, messageBody: 'normalized cache test ' + Date.now() });
+    const firstCount = callCount;
+    // Second call with the SAME normalized form (different casing + punctuation)
+    // should hit the cache.
+    const firstBody = 'normalized cache test abc';
+    const variantBody = '  Normalized, Cache TEST abc!!  ';
+    await refineAmbientDecision({ ...common, messageBody: firstBody });
+    const countAfterFirst = callCount;
+    await refineAmbientDecision({ ...common, messageBody: variantBody });
+    expect(callCount).toBe(countAfterFirst); // no extra call
+    expect(firstCount).toBeGreaterThan(0);
   });
 
   it('message body is truncated to 2000 chars before being passed to haiku', async () => {

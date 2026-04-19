@@ -342,6 +342,9 @@ async function main(): Promise<void> {
           });
 
           // If the sync gate failed with a fuzzy miss, ask Haiku to refine.
+          // refineAmbientDecision returns one of: haiku classifier (pass),
+          // haiku:none, or haiku:error — the reason field is the source of
+          // truth for downstream logging.
           if (!ambientDecision.pass && ambientDecision.reason === 'no fuzzy match') {
             const topScore = scoreFuzzy(body, topicBank)?.score ?? 0;
             ambientDecision = await refineAmbientDecision({
@@ -352,25 +355,8 @@ async function main(): Promise<void> {
               cfg,
             }).catch((e: Error) => {
               dbg(`refineAmbientDecision threw: ${e.message}`);
-              return ambientDecision!;
+              return { pass: false, reason: 'haiku:error' } as AmbientDecision;
             });
-            if (ambientDecision.pass) {
-              logEvent({
-                kind: 'ambient.considered',
-                chat: chat.name,
-                chat_id: chat.id._serialized,
-                matchedTopic: ambientDecision.matchedTopic,
-                score: ambientDecision.score,
-                source: 'haiku',
-              });
-            } else {
-              logEvent({
-                kind: 'ambient.skipped',
-                chat: chat.name,
-                chat_id: chat.id._serialized,
-                reason: 'haiku:none',
-              });
-            }
           }
         } catch (e) {
           dbg(`ambient gate threw: ${(e as Error).message}`);
@@ -378,26 +364,25 @@ async function main(): Promise<void> {
 
         if (!ambientDecision || !ambientDecision.pass) {
           dbg(`ambient skip: ${ambientDecision?.reason ?? 'gate error'}`);
-          if (!ambientDecision || (ambientDecision.reason !== 'haiku:none' && ambientDecision.reason !== 'haiku:error')) {
-            logEvent({
-              kind: 'ambient.skipped',
-              chat: chat.name,
-              chat_id: chat.id._serialized,
-              reason: ambientDecision?.reason ?? 'gate error',
-            });
-          }
+          logEvent({
+            kind: 'ambient.skipped',
+            chat: chat.name,
+            chat_id: chat.id._serialized,
+            reason: ambientDecision?.reason ?? 'gate error',
+          });
           return;
         }
 
-        // Ambient triggered
+        // Ambient triggered (bigram gate pass OR haiku classifier pass)
         trigger = 'ambient';
-        dbg(`ambient triggered: matchedTopic=${ambientDecision.matchedTopic} score=${ambientDecision.score}`);
+        dbg(`ambient triggered: matchedTopic=${ambientDecision.matchedTopic} score=${ambientDecision.score} reason=${ambientDecision.reason}`);
         logEvent({
           kind: 'ambient.considered',
           chat: chat.name,
           chat_id: chat.id._serialized,
           matchedTopic: ambientDecision.matchedTopic,
           score: ambientDecision.score,
+          source: ambientDecision.reason === 'haiku classifier' ? 'haiku' : 'fuzzy',
         });
       }
 

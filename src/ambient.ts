@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { atomicWriteFile } from './atomic';
-import { bestFuzzyMatch, scoreFuzzy } from './fuzzy';
+import { bestFuzzyMatch, scoreFuzzy, normalize } from './fuzzy';
 import { callClaude } from './claude';
 import { VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, AMBIENT_CLASSIFIER_PROMPT, fillTemplate } from './prompts';
 import { loadFeedbackTopics } from './feedback-topics';
@@ -396,6 +396,12 @@ export interface RefineParams {
 // Called after shouldAmbientReply returned { pass: false, reason: 'no fuzzy match' }
 // when the top bigram score is still within the ambiguous band (>= 0.35).
 // Asks Haiku to classify semantically. Caches by sha256 of normalized body.
+//
+// Returns one of three decision shapes:
+//   - pass: true,  reason: 'haiku classifier' — Haiku confirmed a match
+//   - pass: false, reason: 'haiku:none'       — Haiku said no / unparseable
+//   - pass: false, reason: 'haiku:error'      — Haiku threw / timed out (not cached)
+// Callers can distinguish these to log the skipped reason accurately.
 export async function refineAmbientDecision(params: RefineParams): Promise<AmbientDecision> {
   const { originalDecision, topScore, messageBody, topicBank } = params;
 
@@ -408,8 +414,10 @@ export async function refineAmbientDecision(params: RefineParams): Promise<Ambie
   // Cap body to 2000 chars.
   const cappedBody = messageBody.slice(0, 2000);
 
-  // Cache lookup.
-  const cacheKey = crypto.createHash('sha256').update(cappedBody).digest('hex');
+  // Cache lookup keyed on the NORMALIZED body so "Futebol!!" and "futebol"
+  // (and whitespace / diacritic variants) hit the same cache entry.
+  const normalizedBody = normalize(cappedBody);
+  const cacheKey = crypto.createHash('sha256').update(normalizedBody).digest('hex');
   const cached = haikuCache.get(cacheKey);
   if (cached !== undefined) return cached;
 
@@ -424,7 +432,8 @@ export async function refineAmbientDecision(params: RefineParams): Promise<Ambie
     rawOutput = await _haikuImpl.fn(prompt);
   } catch (err) {
     console.warn('[ambient] refineAmbientDecision: haiku failed:', (err as Error).message);
-    return originalDecision;
+    // Do NOT cache errors — transient failures should be retried on the next message.
+    return { pass: false, reason: 'haiku:error' };
   }
 
   // Parse: "topic:<name>" or "none"
@@ -435,11 +444,18 @@ export async function refineAmbientDecision(params: RefineParams): Promise<Ambie
     decision = { pass: false, reason: 'haiku:none' };
   } else if (trimmed.startsWith('topic:')) {
     const name = trimmed.slice('topic:'.length).trim();
-    if (!topicBank.includes(name)) {
+    // Match against bank entries with alias-group expansion. Haiku may return
+    // either the full entry "futebol|jogo|bola" or a single alias like "futebol".
+    // Either should resolve to the full bank entry so downstream code sees the
+    // same topic string the user added via !topic add.
+    const matchedEntry = topicBank.find(entry =>
+      entry === name || entry.split('|').some(alias => alias.trim() === name),
+    );
+    if (!matchedEntry) {
       console.warn(`[ambient] refineAmbientDecision: haiku returned unknown topic "${name}"`);
       decision = { pass: false, reason: 'haiku:none' };
     } else {
-      decision = { pass: true, reason: 'haiku classifier', matchedTopic: name, score: 0.5 };
+      decision = { pass: true, reason: 'haiku classifier', matchedTopic: matchedEntry, score: 0.5 };
     }
   } else {
     // Unparseable — treat as none.
