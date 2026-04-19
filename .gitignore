@@ -9,5 +9,6 @@ data/contacts/
 *.log
 data/events.jsonl
 data/ambient-config.json
+data/limits-config.json
 data/groups/
 tasks/

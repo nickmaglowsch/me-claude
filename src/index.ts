@@ -31,6 +31,31 @@ import {
 } from './ambient';
 import { scoreFuzzy } from './fuzzy';
 import { maybeRefreshFeedbackTopics } from './feedback-topics';
+import {
+  loadLimitsConfig,
+  saveLimitsConfig,
+  ensureDailyReset as ensureLimitsDailyReset,
+  shouldAllowReplyWithPending,
+  recordReply as recordLimitReply,
+  normalizeChatKey as normalizeLimitsKey,
+} from './limits';
+
+// In-memory reservations so concurrent handlers for the same group can't
+// all pass the limit check before any of them increments the on-disk
+// counter. Each handler reserves an optimistic slot when the check passes
+// and releases it after send (whether the message was actually posted or
+// not — a silent Claude reply doesn't burn a slot).
+const pendingLimitReservations = new Map<string, number>();
+
+function reserveLimitSlot(key: string): void {
+  pendingLimitReservations.set(key, (pendingLimitReservations.get(key) ?? 0) + 1);
+}
+
+function releaseLimitSlot(key: string): void {
+  const cur = pendingLimitReservations.get(key) ?? 0;
+  if (cur <= 1) pendingLimitReservations.delete(key);
+  else pendingLimitReservations.set(key, cur - 1);
+}
 
 // Rate limiter: group JID → timestamp of last reply (ms)
 const lastReplyAt = new Map<string, number>();
@@ -174,6 +199,10 @@ async function main(): Promise<void> {
 
   // Register message handler
   client.on('message_create', async (msg: any) => {
+    // Cleanup fn for any limit slot reserved during this handler. Declared
+    // outside the try so the outer catch can still release it if an unexpected
+    // error bubbles up between reserve and release.
+    let releaseReservedSlot: (() => void) = () => {};
     try {
       // Top-of-handler log so we can confirm the event is firing at all
       dbg(`event fromMe=${msg.fromMe} hasQuoted=${msg.hasQuotedMsg} body="${(msg.body || '').slice(0, 40)}"`);
@@ -397,6 +426,46 @@ async function main(): Promise<void> {
       }
       recordReply(lastReplyAt, groupJid, nowMs);
 
+      // Gate 5: per-group daily limit (applies to all triggers).
+      // Check BEFORE burst fetch / Claude call to avoid paying for work we'll drop.
+      // The counter is incremented once a message is actually sent below.
+      // Falls back to the group JID when chat.name is missing/whitespace so
+      // unnamed groups each get their own bucket (otherwise they'd collide
+      // under the "" key and share one override/counter).
+      const chatLimitKey =
+        chat.name && chat.name.trim() ? chat.name : groupJid;
+      const normalizedLimitKey = normalizeLimitsKey(chatLimitKey);
+      const limitsCfg = ensureLimitsDailyReset(loadLimitsConfig());
+      const pending = pendingLimitReservations.get(normalizedLimitKey) ?? 0;
+      const limitDecision = shouldAllowReplyWithPending(limitsCfg, chatLimitKey, pending);
+      if (!limitDecision.allowed) {
+        console.log(
+          `[${trigger}] skipped: group limit reached in [${chat.name}] ` +
+          `(${limitDecision.current}+${pending}/${limitDecision.limit})`,
+        );
+        logEvent({
+          kind: 'skip.group_limit',
+          chat: chat.name,
+          chat_id: groupJid,
+          trigger,
+          current: limitDecision.current,
+          pending,
+          limit: limitDecision.limit,
+        });
+        return;
+      }
+      // Reserve a slot now so concurrent handlers in the same group see it.
+      // The reservation is released either when we decide not to send (silent
+      // reply, unexpected error) or after we persist the on-disk increment.
+      reserveLimitSlot(normalizedLimitKey);
+      let limitSlotReserved = true;
+      releaseReservedSlot = (): void => {
+        if (limitSlotReserved) {
+          releaseLimitSlot(normalizedLimitKey);
+          limitSlotReserved = false;
+        }
+      };
+
       // Fetch a generous pool for BEFORE context; we'll trim it to a burst
       // window in memory so quiet chats get what they have and active bursts
       // get fewer messages from unrelated parallel threads.
@@ -520,8 +589,10 @@ async function main(): Promise<void> {
       const callDurationMs = Date.now() - callStart;
       const reply = response.trim();
 
-      // Silence is allowed — if Claude returns empty, skip
+      // Silence is allowed — if Claude returns empty, skip. Release the
+      // reserved limit slot so a silent reply doesn't burn the group's cap.
       if (!reply) {
+        releaseReservedSlot();
         if (trigger === 'ambient') {
           logEvent({ kind: 'ambient.declined', chat: chat.name, chat_id: groupJid });
           return;
@@ -560,6 +631,19 @@ async function main(): Promise<void> {
         logEvent({ kind: 'ambient.replied', chat: chat.name, trigger: 'ambient' });
       }
 
+      // Per-group daily counter — ticks on every sent reply regardless of trigger.
+      // Reload + reset to avoid stomping updates from other sends in this tick.
+      // Always release the reservation after this block so the in-memory
+      // counter drains even if the disk write fails.
+      try {
+        const freshLimits = ensureLimitsDailyReset(loadLimitsConfig());
+        saveLimitsConfig(recordLimitReply(freshLimits, chatLimitKey));
+      } catch (e) {
+        console.warn('[limits] failed to record reply:', (e as Error).message);
+      } finally {
+        releaseReservedSlot();
+      }
+
       // Log the handled mention
       console.log(`[${chat.name}] ${mentionSenderName}: ${msg.body} -> ${reply}`);
       logEvent({
@@ -574,6 +658,10 @@ async function main(): Promise<void> {
     } catch (err) {
       console.error('Error handling message:', err);
       logEvent({ kind: 'error', reason: (err as Error).message });
+    } finally {
+      // Drain any reservation still held by this handler — covers unexpected
+      // errors between reserve and the normal release point.
+      releaseReservedSlot();
     }
   });
 

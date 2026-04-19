@@ -112,6 +112,9 @@ Messages you send in group chats or DMs to other people that start with `!` are 
 | `!status` | `!status` | Show bot stats for the last 24 hours |
 | `!silence <chat\|all> <duration>` | `!silence mgz 2h` | Mute a specific chat or all chats; duration: `Nm`, `Nh`, `Nd` |
 | `!resume` | `!resume` | Clear all silences and resume normal operation |
+| `!limit <N> [group]` | `!limit 3` or `!limit 10 mgz` | Cap daily replies per group (applies to mentions, replies, and ambient). Omit the group name to set a default that applies to every group. |
+| `!limit off [group]` | `!limit off mgz` | Clear the default limit, or remove a per-group override. |
+| `!limit status` | `!limit status` | Show current default, per-group overrides, and today's counts. |
 
 ### Silence examples
 
@@ -121,6 +124,18 @@ Messages you send in group chats or DMs to other people that start with `!` are 
 !silence all 1d       # global mute for 1 day
 !resume               # unmute everything immediately
 ```
+
+### Limit examples
+
+```
+!limit 3              # every group independently capped at 3/day
+!limit 10 mgz         # override: mgz gets 10/day
+!limit 0 spammers     # kill switch for one group
+!limit off mgz        # drop override (falls back to the default)
+!limit status         # show config + today's counts
+```
+
+> Note: per-group limits key on the normalized chat name (lowercase + trimmed), matching `!silence` and `!ambient off`. Two groups with the same WhatsApp name share a bucket. Unnamed groups are bucketed by JID instead.
 
 ## Ambient replies (opt-in)
 
