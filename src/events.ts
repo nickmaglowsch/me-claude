@@ -26,6 +26,7 @@ export type EventKind =
   | 'ambient.declined'
   | 'skip.ambient_disabled'
   | 'group.persisted'
+  | 'context.window'
   | 'summary.requested'
   | 'summary.no_match'
   | 'summary.multi_match'

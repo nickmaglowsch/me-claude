@@ -33,11 +33,34 @@ describe('fillTemplate', () => {
       SENDER_NAME: 'Alice',
       SENDER_JID: '5511987654321@c.us',
       TODAY: '2026-04-18',
+      QUOTED_BLOCK: '',
       BEFORE_MESSAGES: 'b',
       MENTION_MESSAGE: 'm',
       AFTER_MESSAGES: 'a',
+      GROUP_FOLDER: 'some-group',
     });
     expect(result).not.toMatch(/\{[A-Z_]+\}/);
+  });
+
+  it('RUNTIME_PROMPT renders a QUOTED block when provided', () => {
+    const result = fillTemplate(RUNTIME_PROMPT, {
+      VOICE_PROFILE_GOES_HERE: 'v',
+      SENDER_NAME: 'Alice',
+      SENDER_JID: '5511987654321@c.us',
+      TODAY: '2026-04-18',
+      QUOTED_BLOCK: 'QUOTED (older message being replied to):\n[09:12] Bob: hi\n\n',
+      BEFORE_MESSAGES: 'b',
+      MENTION_MESSAGE: 'm',
+      AFTER_MESSAGES: 'a',
+      GROUP_FOLDER: 'some-group',
+    });
+    expect(result).toContain('QUOTED (older message being replied to):');
+    expect(result).toContain('[09:12] Bob: hi');
+  });
+
+  it('RUNTIME_PROMPT references the archive path', () => {
+    expect(RUNTIME_PROMPT).toContain('data/groups/');
+    expect(RUNTIME_PROMPT).toContain('{GROUP_FOLDER}');
   });
 
   it('RUNTIME_PROMPT contains SENDER_JID and tool instructions', () => {

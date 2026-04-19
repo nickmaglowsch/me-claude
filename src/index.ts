@@ -14,6 +14,7 @@ import { resolveToCus } from './memory';
 import { logEvent } from './events';
 import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
 import { ensureGroupFolder, persistMessage, localDate } from './groups';
+import { selectBurstWindow, extractQuotedAnchor, type ContextMessage } from './context';
 import {
   loadAmbientConfig,
   saveAmbientConfig,
@@ -29,6 +30,14 @@ import {
 const lastReplyAt = new Map<string, number>();
 const RATE_LIMIT_MS = 10_000;  // 1 reply per group per 10 seconds
 const AFTER_WAIT_MS = 8_000;   // wait before replying (to collect after-messages)
+
+// Context-window tuning. A "burst" is a run of messages with no gap larger
+// than BURST_GAP_SEC — we include everything in the current burst up to the
+// caps below. See src/context.ts.
+const BURST_GAP_SEC = 5 * 60;   // 5 minutes — typical pause between threads
+const MAX_BEFORE = 15;          // ceiling even if burst is longer
+const MAX_AFTER = 10;
+const FETCH_POOL_LIMIT = 40;    // how many raw messages to fetch per side
 
 // Silence map: chat-name → muted-until-ms; "*" key for global mute.
 // Managed by the !silence / !resume commands.
@@ -326,20 +335,57 @@ async function main(): Promise<void> {
       }
       recordReply(lastReplyAt, groupJid, nowMs);
 
-      // Fetch BEFORE context: last 11 messages, exclude the mention itself
-      const beforeFetch = await chat.fetchMessages({ limit: 11 });
-      const beforeMessages = beforeFetch
-        .filter((m: any) => m.id._serialized !== msg.id._serialized)
-        .slice(-10); // up to 10, most recent
+      // Fetch a generous pool for BEFORE context; we'll trim it to a burst
+      // window in memory so quiet chats get what they have and active bursts
+      // get fewer messages from unrelated parallel threads.
+      const beforeFetch = await chat.fetchMessages({ limit: FETCH_POOL_LIMIT });
 
       // Wait 8 seconds for possible "after" messages
       await sleep(AFTER_WAIT_MS);
 
-      // Fetch AFTER context: messages that arrived after the mention's timestamp
-      const afterFetch = await chat.fetchMessages({ limit: 20 });
-      const afterMessages = afterFetch
-        .filter((m: any) => m.timestamp > msg.timestamp && m.id._serialized !== msg.id._serialized)
-        .slice(0, 10); // up to 10
+      // Re-fetch after the wait to pick up AFTER-messages. We merge with the
+      // BEFORE pool rather than filtering by timestamp so a single sorted pass
+      // can do both the before and after burst trim.
+      const afterFetch = await chat.fetchMessages({ limit: FETCH_POOL_LIMIT });
+      const rawPool: any[] = [...beforeFetch, ...afterFetch];
+
+      // Shape raw whatsapp-web.js messages into the ContextMessage interface.
+      // We keep a back-reference (`_raw`) so the downstream formatter can call
+      // getContact() / access hasQuotedMsg on the real object.
+      const toCtxMsg = (m: any): ContextMessage & { _raw: any } => ({
+        id: m.id._serialized,
+        timestamp: m.timestamp,
+        body: m.body ?? '',
+        _raw: m,
+      });
+      const triggerCtx = toCtxMsg(msg);
+      const poolCtx = rawPool.map(toCtxMsg);
+
+      const { before, after } = selectBurstWindow(poolCtx, triggerCtx, {
+        burstGapSec: BURST_GAP_SEC,
+        maxBefore: MAX_BEFORE,
+        maxAfter: MAX_AFTER,
+      });
+
+      // If the mention is a reply to an older message that fell outside the
+      // burst window, surface it as a separate QUOTED block. Skip silently
+      // on any whatsapp-web.js error — the reply still works without it.
+      let quotedAnchorRaw: any = null;
+      if (msg.hasQuotedMsg) {
+        try {
+          const q = await msg.getQuotedMessage();
+          if (q) {
+            const windowIds = new Set<string>([
+              ...before.map(m => m.id),
+              ...after.map(m => m.id),
+            ]);
+            const anchor = extractQuotedAnchor(toCtxMsg(q), { windowIds });
+            if (anchor) quotedAnchorRaw = (anchor as any)._raw;
+          }
+        } catch (e) {
+          dbg(`quoted anchor fetch failed: ${(e as Error).message}`);
+        }
+      }
 
       // Helper: format a message line (requires resolving sender name)
       const formatLine = async (m: any): Promise<string> => {
@@ -359,10 +405,29 @@ async function main(): Promise<void> {
           ? mentionContact.id._serialized
           : resolveToCus(rawSenderJid, chat);
 
-      // Format all message lines
-      const beforeLines = await Promise.all(beforeMessages.map(formatLine));
-      const afterLines = await Promise.all(afterMessages.map(formatLine));
+      // Format all message lines using the back-referenced raw messages.
+      const beforeLines = await Promise.all(
+        before.map(m => formatLine((m as any)._raw))
+      );
+      const afterLines = await Promise.all(
+        after.map(m => formatLine((m as any)._raw))
+      );
       const mentionLine = formatMessageLine(msg, mentionSenderName);
+      const quotedLine = quotedAnchorRaw ? await formatLine(quotedAnchorRaw) : null;
+
+      // Look up the archive folder for this group so Claude can grep it if
+      // the conversation references something older than the burst window.
+      const groupFolder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
+
+      logEvent({
+        kind: 'context.window',
+        chat: chat.name,
+        chat_id: groupJid,
+        before_count: before.length,
+        after_count: after.length,
+        has_quoted_anchor: !!quotedLine,
+        burst_gap_sec: BURST_GAP_SEC,
+      });
 
       // Build prompt vars. Memory file read/write is now Claude's job via
       // Read/Edit/Write tools — we only hand it the sender's canonical JID
@@ -373,9 +438,13 @@ async function main(): Promise<void> {
         SENDER_NAME: mentionSenderName,
         SENDER_JID: senderCus ?? rawSenderJid ?? 'unknown',
         TODAY: today,
+        QUOTED_BLOCK: quotedLine
+          ? `QUOTED (older message being replied to):\n${quotedLine}\n\n`
+          : '',
         BEFORE_MESSAGES: beforeLines.length > 0 ? beforeLines.join('\n') : '(no messages before)',
         MENTION_MESSAGE: mentionLine,
         AFTER_MESSAGES: afterLines.length > 0 ? afterLines.join('\n') : '(no messages after yet)',
+        GROUP_FOLDER: groupFolder,
       };
       dbg(`handing off to claude w/ tools; sender=${vars.SENDER_JID}`);
 
