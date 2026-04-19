@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import { atomicWriteFile } from './atomic';
 
 export interface GuardResult {
   status: 'written' | 'rejected' | 'committed';
@@ -41,9 +42,7 @@ function atomicWrite(cusJid: string, contents: string): void {
   const contactsDir = getContactsDir();
   fs.mkdirSync(contactsDir, { recursive: true });
   const finalPath = getContactFilePath(cusJid);
-  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, contents, 'utf8');
-  fs.renameSync(tmpPath, finalPath);
+  atomicWriteFile(finalPath, contents);
 }
 
 function buildCommitSubject(

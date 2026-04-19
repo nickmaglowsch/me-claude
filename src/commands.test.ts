@@ -634,6 +634,66 @@ describe('dispatchCommand — !ambient and !topic', () => {
   });
 });
 
+// ---- dispatchCommand — !topic add validation --------------------------------
+
+describe('dispatchCommand — !topic add validation', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'topic-test-'));
+    // Create the data dir so saveAmbientConfig can write
+    fs.mkdirSync(path.join(tmpDir, 'data'), { recursive: true });
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('!topic add phrase > 64 chars is rejected with error reply', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    const longPhrase = 'a'.repeat(65);
+    await dispatchCommand(parseCommand(`!topic add ${longPhrase}`)!, ctx);
+    expect(replies[0]).toMatch(/too long|64/i);
+  });
+
+  it('!topic add accepts phrase exactly 64 chars', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    const exactPhrase = 'a'.repeat(64);
+    await dispatchCommand(parseCommand(`!topic add ${exactPhrase}`)!, ctx);
+    expect(replies[0]).toMatch(/^ok, added/);
+  });
+
+  it('!topic add is rejected when bank has 200 entries', async () => {
+    // Pre-populate ambient config with 200 explicit topics
+    const cfg = {
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: Array.from({ length: 200 }, (_, i) => `topic-${i}`),
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: new Date().toISOString().slice(0, 10),
+    };
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'ambient-config.json'),
+      JSON.stringify(cfg, null, 2),
+      'utf8',
+    );
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!topic add new-topic')!, ctx);
+    expect(replies[0]).toMatch(/limit|200|full/i);
+  });
+});
+
 // ---- parseDateSpec ----------------------------------------------------------
 
 describe('parseDateSpec', () => {

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { atomicWriteFile } from './atomic';
 import { bestFuzzyMatch } from './fuzzy';
 import { callClaude } from './claude';
 import { VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, fillTemplate } from './prompts';
@@ -37,15 +38,35 @@ function resolvedConfigPath(): string {
   return path.join(process.cwd(), AMBIENT_CONFIG_PATH);
 }
 
+function isValidAmbientConfig(obj: unknown): obj is AmbientConfig {
+  if (typeof obj !== 'object' || obj === null) return false;
+  const c = obj as Record<string, unknown>;
+  return (
+    typeof c.masterEnabled === 'boolean' &&
+    Array.isArray(c.disabledGroups) &&
+    Array.isArray(c.explicitTopics) &&
+    typeof c.dailyCap === 'number' &&
+    typeof c.confidenceThreshold === 'number' &&
+    Array.isArray(c.voiceProfileTopics) &&
+    typeof c.voiceProfileMtime === 'number' &&
+    Array.isArray(c.repliesToday) &&
+    typeof c.lastReset === 'string'
+  );
+}
+
 export function loadAmbientConfig(): AmbientConfig {
   const cfgPath = resolvedConfigPath();
   try {
     const raw = fs.readFileSync(cfgPath, 'utf8');
-    return JSON.parse(raw) as AmbientConfig;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isValidAmbientConfig(parsed)) {
+      console.warn('[ambient] ambient-config.json failed schema validation, using defaults');
+      return defaultAmbientConfig();
+    }
+    return parsed;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      // Malformed JSON or other read error — log and return defaults.
       console.warn('[ambient] failed to parse ambient config, using defaults:', (err as Error).message);
     }
     return defaultAmbientConfig();
@@ -55,9 +76,7 @@ export function loadAmbientConfig(): AmbientConfig {
 export function saveAmbientConfig(cfg: AmbientConfig): void {
   const cfgPath = resolvedConfigPath();
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
-  const tmpPath = `${cfgPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2), 'utf8');
-  fs.renameSync(tmpPath, cfgPath);
+  atomicWriteFile(cfgPath, JSON.stringify(cfg, null, 2));
 }
 
 // Returns today's date as "YYYY-MM-DD".

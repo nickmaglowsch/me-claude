@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { callClaude, _config } from './claude';
+import { callClaude, callClaudeWithTools, _config } from './claude';
 
 describe('callClaude', () => {
   beforeEach(() => {
@@ -24,5 +24,35 @@ describe('callClaude', () => {
     _config.args = ['-e', 'setTimeout(() => {}, 999999);'];
     _config.timeoutMs = 100;
     await expect(callClaude('test')).rejects.toThrow('timed out');
+  });
+});
+
+describe('callClaudeWithTools', () => {
+  beforeEach(() => {
+    _config.command = 'node';
+    _config.args = [];
+    _config.toolTimeoutMs = 60000;
+  });
+
+  it('cwd arg is forwarded to spawn', async () => {
+    // callClaudeWithTools appends --allowed-tools etc. as extra CLI args; node
+    // rejects unknown flags unless they come after '--'. Use a helper script
+    // written to a tmp file so the args are treated as argv (ignored) rather
+    // than node flags.
+    const os = await import('os');
+    const fs = await import('fs');
+    const path = await import('path');
+    const scriptPath = path.join(os.tmpdir(), 'cwd-test-helper.mjs');
+    fs.writeFileSync(
+      scriptPath,
+      // Script ignores argv (the --allowed-tools etc.) and just prints cwd
+      "process.stdin.resume(); process.stdin.on('data', () => process.stdout.write(process.cwd()));\n",
+      'utf8',
+    );
+    _config.command = 'node';
+    _config.args = [scriptPath];
+    const result = await callClaudeWithTools('x', '/tmp');
+    fs.unlinkSync(scriptPath);
+    expect(result).toBe('/tmp');
   });
 });

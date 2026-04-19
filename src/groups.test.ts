@@ -67,6 +67,55 @@ describe('slugifyGroupName', () => {
   it('trims leading/trailing dashes: "---mgz---" → "mgz"', () => {
     expect(slugifyGroupName('---mgz---', 'f')).toBe('mgz');
   });
+
+  // --- safety-net: adversarial names must not produce traversal paths ---------
+  // These lock in the current sanitization behavior so task-02 (hash suffix)
+  // cannot accidentally regress the traversal protection.
+
+  it('path traversal "../../etc/passwd" → does not produce a slug starting with "/" or containing ".."', () => {
+    const slug = slugifyGroupName('../../etc/passwd', 'fallback');
+    expect(slug).not.toContain('..');
+    expect(slug).not.toMatch(/^\//);
+    expect(slug.length).toBeGreaterThan(0);
+  });
+
+  it('all-asterisks "***" → fallback (empty after normalization)', () => {
+    const slug = slugifyGroupName('***', 'fallback');
+    // normalize() strips punctuation; "***" becomes "" → falls back
+    expect(slug).toBe('fallback');
+  });
+
+  it('fire emoji "🔥group" → slug contains "group" and is not absolute', () => {
+    const slug = slugifyGroupName('🔥group', 'fallback');
+    expect(slug).toContain('group');
+    expect(slug).not.toMatch(/^\//);
+    expect(slug).not.toContain('..');
+  });
+
+  it('slug containing only slashes and dots → fallback used (no traversal)', () => {
+    const slug = slugifyGroupName('../..', 'safe-fallback');
+    // normalize strips dots and slashes → empty → fallback
+    expect(slug).not.toContain('/');
+    expect(slug).not.toContain('..');
+    // Either the fallback or a sanitized non-empty string, but never "." or ".."
+    expect(slug).not.toBe('.');
+    expect(slug).not.toBe('..');
+  });
+
+  it('slug result is never an absolute path regardless of input', () => {
+    const adversarial = [
+      '/etc/passwd',
+      '//etc//passwd',
+      '/root',
+      '../../../root',
+      '\0null',
+    ];
+    for (const input of adversarial) {
+      const slug = slugifyGroupName(input, 'safe');
+      expect(slug).not.toMatch(/^\//);
+      expect(slug).not.toContain('..');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -109,40 +158,104 @@ describe('saveGroupIndex + loadGroupIndex roundtrip', () => {
     const leftover = fs.readdirSync(groupsDirAbs()).filter(f => f.includes('.tmp-'));
     expect(leftover).toHaveLength(0);
   });
+
+  // --- safety-net: correct final content on overwrite ------------------------
+  // Protects task-05 (random tmp naming + O_EXCL) from regressing overwrite.
+  it('second save fully replaces first: only second entry survives', () => {
+    const v1: GroupIndex = { 'old@g.us': { name: 'old group', folder: 'old-group' } };
+    const v2: GroupIndex = { 'new@g.us': { name: 'new group', folder: 'new-group' } };
+
+    saveGroupIndex(v1);
+    saveGroupIndex(v2);
+
+    const loaded = loadGroupIndex();
+    expect(loaded['new@g.us']).toEqual({ name: 'new group', folder: 'new-group' });
+    expect(loaded['old@g.us']).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
 // ensureGroupFolder
 // ---------------------------------------------------------------------------
 describe('ensureGroupFolder', () => {
-  it('new JID: creates index entry, returns slug', () => {
+  it('new JID: creates index entry, returns slug with JID hash suffix', () => {
     const folder = ensureGroupFolder('111@g.us', 'mgz');
-    expect(folder).toBe('mgz');
+    // With hash suffix: "mgz-93d7c9" (sha256("111@g.us").slice(0,6))
+    expect(folder).toMatch(/^mgz-[0-9a-f]{6}$/);
     const idx = loadGroupIndex();
-    expect(idx['111@g.us']).toEqual({ name: 'mgz', folder: 'mgz' });
+    expect(idx['111@g.us']).toEqual({ name: 'mgz', folder });
   });
 
   it('existing JID: returns cached folder without re-slugging', () => {
-    ensureGroupFolder('111@g.us', 'mgz');
+    const original = ensureGroupFolder('111@g.us', 'mgz');
     // Call again with a different name — should still return original folder
     const folder = ensureGroupFolder('111@g.us', 'something else entirely');
-    expect(folder).toBe('mgz');
+    expect(folder).toBe(original);
   });
 
-  it('collision: two JIDs with same chat name → second gets "-2" suffix', () => {
+  it('collision: two JIDs with same chat name get distinct folders via JID hash', () => {
     const folder1 = ensureGroupFolder('111@g.us', 'mgz');
     const folder2 = ensureGroupFolder('222@g.us', 'mgz');
-    expect(folder1).toBe('mgz');
-    expect(folder2).toBe('mgz-2');
+    // Different JIDs → different hashes → no collision, no "-2" needed
+    expect(folder1).not.toBe(folder2);
+    expect(folder1).toMatch(/^mgz-[0-9a-f]{6}$/);
+    expect(folder2).toMatch(/^mgz-[0-9a-f]{6}$/);
   });
 
-  it('three collisions: slots "-2" and "-3" assigned in order', () => {
-    const f1 = ensureGroupFolder('111@g.us', 'mgz');
-    const f2 = ensureGroupFolder('222@g.us', 'mgz');
-    const f3 = ensureGroupFolder('333@g.us', 'mgz');
-    expect(f1).toBe('mgz');
-    expect(f2).toBe('mgz-2');
-    expect(f3).toBe('mgz-3');
+  it('collision counter: "-2" suffix used when hash+slug already exists in index', () => {
+    // Pre-populate the index with an entry that occupies the exact baseSlug
+    // that '111@g.us' would generate, forcing the counter fallback.
+    const jid = '111@g.us';
+    const firstFolder = ensureGroupFolder(jid, 'mgz');
+    // Delete that JID from the index so we can test the counter with another JID
+    // that happens to want the same folder. Manually craft such a scenario:
+    // save the first-JID's folder as belonging to a phantom JID, then register a
+    // new JID that produces the same baseSlug (impossible in practice since hashes
+    // differ, so simulate by pre-occupying the slot).
+    saveGroupIndex({ 'phantom@g.us': { name: 'mgz', folder: firstFolder } });
+    // Now register the real JID — its baseSlug ("mgz-93d7c9") is taken, so it
+    // must use the counter fallback.
+    const folder2 = ensureGroupFolder(jid, 'mgz');
+    expect(folder2).toBe(`${firstFolder}-2`);
+  });
+
+  it('three collisions: counter increments correctly past occupied slots', () => {
+    const jid = '111@g.us';
+    const baseFolder = ensureGroupFolder(jid, 'mgz');
+    // Occupy baseFolder and baseFolder-2 under phantom JIDs
+    saveGroupIndex({
+      'phantom1@g.us': { name: 'mgz', folder: baseFolder },
+      'phantom2@g.us': { name: 'mgz', folder: `${baseFolder}-2` },
+    });
+    // Next registration of the same JID must skip to "-3"
+    const folder3 = ensureGroupFolder(jid, 'mgz');
+    expect(folder3).toBe(`${baseFolder}-3`);
+  });
+
+  // --- safety-net: idempotency ------------------------------------------------
+  // Calling ensureGroupFolder twice with the same JID must return the same path.
+  // This protects task-02 (hash suffix) from accidentally breaking the cache.
+  it('idempotency: second call with same JID returns identical folder path', () => {
+    const first = ensureGroupFolder('idempotent@g.us', 'my group');
+    const second = ensureGroupFolder('idempotent@g.us', 'my group');
+    expect(second).toBe(first);
+  });
+
+  it('idempotency: second call with same JID but DIFFERENT name still returns original folder', () => {
+    const first = ensureGroupFolder('stable-jid@g.us', 'original name');
+    const second = ensureGroupFolder('stable-jid@g.us', 'completely different name');
+    expect(second).toBe(first);
+  });
+
+  // --- safety-net: adversarial group names do not produce traversal paths -----
+  it('adversarial group name "../../etc" does not produce a folder containing ".."', () => {
+    const folder = ensureGroupFolder('evil@g.us', '../../etc');
+    expect(folder).not.toContain('..');
+    expect(folder).not.toMatch(/^\//);
+    // The resulting folder must be a safe relative segment
+    const resolvedPath = path.join(groupsDirAbs(), folder);
+    // resolved path must be a strict child of groupsDirAbs (no traversal above it)
+    expect(resolvedPath.startsWith(groupsDirAbs())).toBe(true);
   });
 });
 
@@ -168,8 +281,9 @@ function makeMsg(overrides: Partial<PersistedMessage> = {}): PersistedMessage {
 describe('persistMessage + readDayMessages', () => {
   it('single message persisted: readDayMessages returns identical record', () => {
     const msg = makeMsg();
+    const folder = ensureGroupFolder('111@g.us', 'mgz');
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg });
-    const result = readDayMessages('mgz', '2026-04-18');
+    const result = readDayMessages(folder, '2026-04-18');
     expect(result).toHaveLength(1);
     expect(result[0]).toEqual(msg);
   });
@@ -178,10 +292,11 @@ describe('persistMessage + readDayMessages', () => {
     const msg1 = makeMsg({ id: 'msg-001', body: 'first' });
     const msg2 = makeMsg({ id: 'msg-002', body: 'second' });
     const msg3 = makeMsg({ id: 'msg-003', body: 'third' });
+    const folder = ensureGroupFolder('111@g.us', 'mgz');
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg: msg1 });
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg: msg2 });
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg: msg3 });
-    const result = readDayMessages('mgz', '2026-04-18');
+    const result = readDayMessages(folder, '2026-04-18');
     expect(result).toHaveLength(3);
     expect(result[0].body).toBe('first');
     expect(result[1].body).toBe('second');
@@ -191,10 +306,11 @@ describe('persistMessage + readDayMessages', () => {
   it('messages on different days go to different files', () => {
     const msg1 = makeMsg({ id: 'msg-a', local_date: '2026-04-18', ts: '2026-04-18T10:00:00.000Z' });
     const msg2 = makeMsg({ id: 'msg-b', local_date: '2026-04-19', ts: '2026-04-19T10:00:00.000Z' });
+    const folder = ensureGroupFolder('111@g.us', 'mgz');
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg: msg1 });
     persistMessage({ chatJid: '111@g.us', chatName: 'mgz', msg: msg2 });
-    const day18 = readDayMessages('mgz', '2026-04-18');
-    const day19 = readDayMessages('mgz', '2026-04-19');
+    const day18 = readDayMessages(folder, '2026-04-18');
+    const day19 = readDayMessages(folder, '2026-04-19');
     expect(day18).toHaveLength(1);
     expect(day18[0].id).toBe('msg-a');
     expect(day19).toHaveLength(1);
@@ -352,5 +468,47 @@ describe('path helpers', () => {
     expect(dayFilePath('mgz', '2026-04-18')).toBe(
       path.join(groupsDirAbs(), 'mgz', '2026-04-18.jsonl'),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ensureGroupFolder — jid hash suffix
+// ---------------------------------------------------------------------------
+describe('ensureGroupFolder — jid hash suffix', () => {
+  it('new group folder includes 6-char hex suffix derived from JID', () => {
+    const folder = ensureGroupFolder('120363123456789@g.us', 'mgz');
+    // folder should be "mgz-<6hex>"
+    expect(folder).toMatch(/^mgz-[0-9a-f]{6}$/);
+  });
+
+  it('two groups with identical names get different folders due to JID hash', () => {
+    const f1 = ensureGroupFolder('111111111111111@g.us', 'mgz');
+    const f2 = ensureGroupFolder('222222222222222@g.us', 'mgz');
+    expect(f1).not.toBe(f2);
+    // both should be "mgz-<6hex>" but different suffixes
+    expect(f1).toMatch(/^mgz-[0-9a-f]{6}$/);
+    expect(f2).toMatch(/^mgz-[0-9a-f]{6}$/);
+  });
+
+  it('same JID called twice returns same folder (cached in index)', () => {
+    const f1 = ensureGroupFolder('111111111111111@g.us', 'mgz');
+    const f2 = ensureGroupFolder('111111111111111@g.us', 'different name');
+    expect(f1).toBe(f2);
+  });
+
+  it('existing index entries from before this change are not migrated', () => {
+    // Pre-populate index with an entry in the OLD format (no hash)
+    saveGroupIndex({ 'old-group@g.us': { name: 'legacy', folder: 'legacy' } });
+    const folder = ensureGroupFolder('old-group@g.us', 'legacy');
+    expect(folder).toBe('legacy'); // returned as-is, NOT renamed
+  });
+
+  it('hash is deterministic: same JID always produces same 6 chars', () => {
+    const jid = '120363999888777@g.us';
+    const f1 = ensureGroupFolder(jid, 'alpha');
+    // Wipe the index to simulate a second bot instance
+    saveGroupIndex({});
+    const f2 = ensureGroupFolder(jid, 'alpha');
+    expect(f1).toBe(f2);
   });
 });

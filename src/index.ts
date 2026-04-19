@@ -14,6 +14,7 @@ import { resolveToCus } from './memory';
 import { logEvent } from './events';
 import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
 import { ensureGroupFolder, persistMessage, localDate } from './groups';
+import { createSandbox, destroySandbox, sanitizePushname } from './sandbox';
 import { selectBurstWindow, extractQuotedAnchor, type ContextMessage } from './context';
 import {
   loadAmbientConfig,
@@ -107,10 +108,10 @@ export function pickDispatchMode(trigger: 'mention' | 'reply' | 'ambient'): Disp
 // in callClaudeWithTools. We no longer pre-load memory files or post-write them
 // from here — Claude decides what to read and what to update on its own.
 //
-// TODO(memory-guard): Claude's Edit/Write tool calls bypass memory-guard.ts entirely.
-// guardedWriteContactMemory is only invoked by memory-bootstrap.ts. A future task
-// can add a post-claude hook that inspects git diff after callClaudeWithTools returns
-// and validates any memory file changes against the corruption rules retroactively.
+// intentionally deferred — see security-refactor notes (task-01)
+// Claude's Edit/Write tool calls bypass memory-guard.ts entirely.
+// guardedWriteContactMemory is only invoked by memory-bootstrap.ts.
+// V-002 deferred: the sandbox cwd (task-01) limits blast radius.
 
 async function main(): Promise<void> {
   const client = createClient();
@@ -420,7 +421,9 @@ async function main(): Promise<void> {
       // memory key — it's the canonical form Claude will use when Read/Edit'ing
       // data/contacts/<jid>.md, regardless of whether msg.author was @lid.
       const mentionContact = await msg.getContact();
-      const mentionSenderName = mentionContact.pushname || mentionContact.number || 'Someone';
+      const mentionSenderName = sanitizePushname(
+        mentionContact.pushname || mentionContact.number || 'Someone'
+      );
       const rawSenderJid = msg.author ?? msg.from;
       const senderCus =
         mentionContact.id?._serialized && mentionContact.id._serialized.endsWith('@c.us')
@@ -469,7 +472,15 @@ async function main(): Promise<void> {
       const promptTemplate =
         trigger === 'ambient' ? AMBIENT_PROMPT_PREFIX + RUNTIME_PROMPT : RUNTIME_PROMPT;
       const callStart = Date.now();
-      const response = await callClaudeWithTools(fillTemplate(promptTemplate, vars));
+      const sandboxDir = await createSandbox(vars.SENDER_JID, vars.GROUP_FOLDER);
+      let response = '';
+      try {
+        response = await callClaudeWithTools(fillTemplate(promptTemplate, vars), sandboxDir);
+      } finally {
+        await destroySandbox(sandboxDir).catch((e: Error) =>
+          console.warn('[sandbox] cleanup failed:', e.message)
+        );
+      }
       const callDurationMs = Date.now() - callStart;
       const reply = response.trim();
 

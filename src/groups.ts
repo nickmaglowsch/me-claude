@@ -1,5 +1,7 @@
+import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
+import { atomicWriteFile } from './atomic';
 import { normalize, diceSimilarity } from './fuzzy';
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,11 @@ export function slugifyGroupName(name: string, fallback: string): string {
   return slug.length > 0 ? slug : fallback;
 }
 
+/** Returns the first 6 hex characters of sha256(jid). */
+function jidHash6(jid: string): string {
+  return crypto.createHash('sha256').update(jid).digest('hex').slice(0, 6);
+}
+
 // ---------------------------------------------------------------------------
 // Index manifest I/O
 // ---------------------------------------------------------------------------
@@ -115,9 +122,7 @@ export function saveGroupIndex(idx: GroupIndex): void {
   const dir = groupsDirAbs();
   fs.mkdirSync(dir, { recursive: true });
   const finalPath = indexPath();
-  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(idx, null, 2), 'utf8');
-  fs.renameSync(tmpPath, finalPath);
+  atomicWriteFile(finalPath, JSON.stringify(idx, null, 2));
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +146,8 @@ export function ensureGroupFolder(chatJid: string, chatName: string): string {
 
   // Generate a unique folder name for the new JID
   const jidUserPart = chatJid.split('@')[0] ?? chatJid;
-  const baseSlug = slugifyGroupName(chatName, jidUserPart);
+  const slugBase = slugifyGroupName(chatName, jidUserPart);
+  const baseSlug = `${slugBase}-${jidHash6(chatJid)}`;
 
   // Collect all folders already in use
   const usedFolders = new Set(Object.values(idx).map(e => e.folder));

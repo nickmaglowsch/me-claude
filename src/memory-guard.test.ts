@@ -259,4 +259,32 @@ describe('guardedWriteContactMemory', () => {
     const log = execSync('git log --all --format=%s', { cwd: contactsDir }).toString();
     expect(log).toMatch(/memory: update/);
   });
+
+  // --- safety-net: atomic write properties ------------------------------------
+  // These protect task-05 (O_EXCL + random tmp naming) from breaking the
+  // invariants that the current pid+timestamp naming already provides.
+
+  it('atomic write: no .tmp-* files remain in contacts dir after a successful write', async () => {
+    const jid = 'atomicclean@c.us';
+    const result = await guardedWriteContactMemory(jid, '## Identity\n\nClean atomic write.\n');
+    expect(['written', 'committed']).toContain(result.status);
+
+    const contactsDir = path.join(tmpDir, 'data', 'contacts');
+    const leftovers = fs.readdirSync(contactsDir).filter(f => f.includes('.tmp-'));
+    expect(leftovers).toHaveLength(0);
+  });
+
+  it('atomic write: correct final content when overwriting an existing file', async () => {
+    const jid = 'overwrite-test@c.us';
+    const v1 = '## Identity\n\nFirst version of the file.\n';
+    const v2 = '## Identity\n\nSecond version with updated info.\n';
+
+    await guardedWriteContactMemory(jid, v1);
+    await guardedWriteContactMemory(jid, v2);
+
+    const filePath = path.join(tmpDir, 'data', 'contacts', `${jid}.md`);
+    const onDisk = fs.readFileSync(filePath, 'utf8');
+    expect(onDisk).toBe(v2);
+    expect(onDisk).not.toContain('First version');
+  });
 });

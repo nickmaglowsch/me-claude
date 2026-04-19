@@ -468,6 +468,16 @@ async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
       await ctx.reply('usage: !topic add <phrase>');
       return;
     }
+    // Length cap
+    if (phrase.length > 64) {
+      await ctx.reply(`phrase too long (${phrase.length} chars). Max 64.`);
+      return;
+    }
+    // Bank size cap
+    if (cfg.explicitTopics.length >= 200) {
+      await ctx.reply(`topic bank full (${cfg.explicitTopics.length}/200 entries). Remove a topic first.`);
+      return;
+    }
     const alreadyExists = cfg.explicitTopics.some(t => t.toLowerCase() === phrase);
     if (!alreadyExists) {
       const updated = { ...cfg, explicitTopics: [...cfg.explicitTopics, phrase] };
