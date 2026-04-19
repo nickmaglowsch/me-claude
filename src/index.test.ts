@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isMentioned, isRateLimited, recordReply, sleep } from './index';
+import { isMentioned, isRateLimited, recordReply, sleep, pickDispatchMode } from './index';
 
 describe('isMentioned', () => {
   it('returns true when any ownerId is in mentionedIds', () => {
@@ -79,5 +79,19 @@ describe('sleep', () => {
     await sleep(50);
     const elapsed = Date.now() - start;
     expect(elapsed).toBeGreaterThanOrEqual(40);
+  });
+});
+
+describe('pickDispatchMode', () => {
+  it('returns "reply" for mention triggers so the outbound message quotes the mention', () => {
+    expect(pickDispatchMode('mention')).toBe('reply');
+  });
+
+  it('returns "reply" for reply triggers so threading is preserved', () => {
+    expect(pickDispatchMode('reply')).toBe('reply');
+  });
+
+  it('returns "send" for ambient triggers so the bot posts to the group without quoting', () => {
+    expect(pickDispatchMode('ambient')).toBe('send');
   });
 });
