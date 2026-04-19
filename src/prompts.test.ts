@@ -47,6 +47,12 @@ describe('fillTemplate', () => {
     expect(RUNTIME_PROMPT).toContain('Edit');
   });
 
+  it('fillTemplate handles $ in values without interpreting as back-references', () => {
+    expect(fillTemplate('Hello {X}', { X: 'a$&b' })).toBe('Hello a$&b');
+    expect(fillTemplate('{X}', { X: '$$' })).toBe('$$');
+    expect(fillTemplate('{X}', { X: '$1 $2 $&' })).toBe('$1 $2 $&');
+  });
+
   it('MEMORY_UPDATE_PROMPT smoke test — no unfilled placeholders after fill', async () => {
     const { MEMORY_UPDATE_PROMPT } = await import('./prompts');
     const result = fillTemplate(MEMORY_UPDATE_PROMPT, {

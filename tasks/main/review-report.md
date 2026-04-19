@@ -1,222 +1,255 @@
-# Code Review Report — Ambient Reply Feature
+# Code Review Report — Group Message Archive + `!summary` Command
 
 ## Summary
 
-The ambient reply feature is implemented cleanly across both tasks and is close to ship-ready. 196/196 tests pass, build is clean, safety defaults are correct (`masterEnabled: false`), gate ordering matches spec, atomic writes are used, and the runtime integration respects existing gates (group, fromMe, rate-limit, silence). One small user-visible arithmetic bug in `!ambient status` (negative memory count when sources overlap) and a handful of minor polish items. No critical issues.
+The feature is implemented cleanly across `src/groups.ts` (Task 01) and the
+runtime/command wiring in `src/index.ts`, `src/commands.ts`, `src/events.ts`,
+`src/prompts.ts`, and `README.md` (Task 02). 248/248 tests pass, `tsc` is
+clean, and the design matches the shared-context spec: local-date bucketing,
+JID-keyed manifest, non-fatal persist errors, fuzzy group matching, proper
+handler ordering (persist BEFORE `fromMe` gate, AFTER `getChat()`). No
+critical blockers. A handful of important polish items and a couple of
+minor improvements worth addressing before calling this done.
 
 ## PRD Compliance
 
-| # | Requirement | Status | Notes |
-|---|-------------|--------|-------|
-| 1 | `src/fuzzy.ts` exports normalize, diceSimilarity, bestFuzzyMatch | Complete | Plus `FuzzyMatch` interface |
-| 2 | `src/ambient.ts` exports listed functions + AmbientConfig | Complete | All present |
-| 3 | Config I/O uses atomic tmp+rename | Complete | `saveAmbientConfig` uses `tmp-<pid>-<ts>` then `rename` |
-| 4 | `shouldAmbientReply` implements all 6 gates in order | Complete | master → disabledGroups → dailyCap → short msg → empty bank → fuzzy |
-| 5 | `loadMemoryTopics` parses `## Recurring topics` sections | Complete | Case-insensitive header match, stops at next `##` |
-| 6 | `buildTopicBank` merges + dedupes 3 sources | Complete | Lowercases+trims each entry; dedups via Set |
-| 7 | `AMBIENT_PROMPT_PREFIX` + `VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT` exported | Complete | Text matches spec verbatim |
-| 8 | EventKind gains 5 new values | Complete | All five added as pure union additions |
-| 9 | `.gitignore` has `data/ambient-config.json` | Complete | Line 11 |
-| 10 | Default `masterEnabled = false` | Complete | `defaultAmbientConfig()` returns false |
-| 11 | `!ambient on/off/on<chat>/off<chat>/status/cap/threshold/refresh` | Complete | All sub-commands implemented |
-| 12 | `!topic add/remove/list` | Complete | All sub-commands implemented |
-| 13 | Chat-name normalization (lowercase+trim) for disabledGroups | Complete | Uses `normalizeChatKey` in both store + lookup |
-| 14 | Ambient path runs ONLY after group-check and fromMe-check | Complete | Ambient path at line 215-252, after gates 1 & 2 |
-| 15 | `AMBIENT_PROMPT_PREFIX` prepended only when trigger==='ambient' | Complete | Ternary on line 331-332 |
-| 16 | Rate-limit (10s) still applies to ambient | Complete | Rate-limit check happens AFTER ambient gate at line 259 |
-| 17 | Successful ambient reply records to repliesToday and emits ambient.replied | Complete | Lines 368-372 |
-| 18 | Empty claude response for ambient emits ambient.declined | Complete | Lines 340-343 |
-| 19 | Ambient skipped emits ambient.skipped with reason | Complete | Lines 231-239 |
-| 20 | No hardcoded reply prefix ("falando nisso") — voice profile governs | Complete | Prompt instructs Claude NOT to use that phrase |
-| 21 | `!ambient on` = global; `!ambient off <chat>` = per-group opt-OUT | Complete | Blocklist semantics verified |
-| 22 | Fuzzy with threshold, not substring | Complete | Dice bigram similarity with configurable threshold |
-| 23 | `extractVoiceProfileTopics` + `maybeRefreshVoiceProfileTopics` | Complete | Mtime-gated refresh, returns [] on failure, never throws |
-| 24 | README has Ambient Replies section | Complete | Lines 125-165 |
-| 25 | `npm run build` exits 0 | Complete | Verified |
-| 26 | `npm test` passes (existing 139 + new) | Complete | 196/196 pass |
+| # | Requirement (Task 01) | Status | Notes |
+|---|-----------------------|--------|-------|
+| 1 | Types: `PersistedMessage`, `GroupIndexEntry`, `GroupIndex`, `GroupMatch` exported | ✅ | All shapes match spec |
+| 2 | Path helpers (`GROUPS_DIR`, `groupsDirAbs`, `indexPath`, `groupFolderPath`, `dayFilePath`) | ✅ | All cwd-relative, resolved at call time |
+| 3 | `slugifyGroupName(name, fallback)` handles accents, emojis, punctuation, collapse, trim | ✅ | Correctly uses `normalize()` from fuzzy.ts plus extra ASCII-only pass to strip residual Unicode letters |
+| 4 | `loadGroupIndex`/`saveGroupIndex` — atomic tmp+rename, never throws on load | ✅ | Matches memory.ts pattern |
+| 5 | `ensureGroupFolder` — collision `-2`/`-3` suffixing | ✅ | Counter loop correctly increments over existing `usedFolders` set |
+| 6 | `persistMessage` — append-only JSONL, swallows fs errors | ✅ | Sync append, trailing `\n`, catches and warns |
+| 7 | `readDayMessages` — returns in file order, skips malformed lines with one warning | ✅ | Missing file → `[]`, correct |
+| 8 | `listDays` — sorted desc, empty on missing dir | ✅ | Regex filter tight (`^\d{4}-\d{2}-\d{2}\.jsonl$`) |
+| 9 | `findGroupsByName` — 0.4 threshold dice similarity, sorted desc | ✅ | Matches spec |
+| 10 | `localDate` — local timezone, not UTC | ✅ | Uses `toLocaleDateString('en-CA')` |
+| 11 | `data/groups/` added to `.gitignore` | ✅ | Appended at end of file |
 
-**Compliance Score**: 26/26 requirements fully met
+| # | Requirement (Task 02) | Status | Notes |
+|---|-----------------------|--------|-------|
+| 12 | `SUMMARY_PROMPT` exported from `src/prompts.ts` | ✅ | Exact spec wording |
+| 13 | `!summary` wired in dispatcher; `HELP_TEXT` updated | ✅ | Case added to switch |
+| 14 | `parseDateSpec` exported, covers today/undefined/empty/yesterday/Nd/YYYY-MM-DD/null | ✅ | Uses `localDate(Date.now()-Nd*ms)` |
+| 15 | `persistMessage` called early in handler, errors swallowed | ✅ | Placed AFTER `chat.isGroup` check, BEFORE `fromMe` gate |
+| 16 | System-message types NOT persisted | ✅ | SYSTEM_TYPES set includes all 5 spec types plus `revoked`/`call_log` |
+| 17 | `!summary` covers: no match, multi-match, empty day, happy path, claude error | ✅ | All branches present, log events emitted |
+| 18 | New EventKind values added | ✅ | `group.persisted`, `summary.requested/no_match/multi_match/empty/generated/error` |
+| 19 | README new section documented | ✅ | Layout, folder-naming rule, command examples |
+| 20 | `npm run build` exits 0, tests all green | ✅ | 248 tests pass, tsc clean |
+
+**Compliance Score**: 20/20 requirements fully met.
 
 ## Issues Found
 
 ### Critical (must fix before shipping)
 
-- None
+_None._
 
 ### Important (should fix)
 
-- **`src/commands.ts:403`**: `!ambient status` reports memory count via `topicBank.length - cfg.explicitTopics.length - cfg.voiceProfileTopics.length`. This is incorrect whenever topics overlap across sources. Example: explicit=["tennis"], voice=["tennis","startups"], memory=[] → `topicBank=["tennis","startups"]` (size 2), formula yields `2 - 1 - 2 = -1`. The status line will show "memory: -1" to the user. Fix: compute `memoryTopics = loadMemoryTopics()` explicitly and report `memoryTopics.length` (pre-dedupe) or compute the post-dedupe memory contribution by tracking origins during the merge. No existing test caught this because `commands.test.ts:483-492` only asserts that master/cap/threshold keywords appear, not the arithmetic.
+- **`src/index.ts:212`**: For Nick's own messages (`msg.fromMe === true`),
+  `fromJid` falls through to `msg.author ?? msg.from ?? ''`. In
+  whatsapp-web.js, `msg.from` on an outgoing group message is the SENDER's
+  JID in most cases but `msg.author` is typically unset — the resulting
+  `from_jid` is usually Nick's own JID, not the group JID, so this is not
+  a data-corruption bug. However, it is fragile and variant across
+  whatsapp-web.js versions. Prefer deriving Nick's JID explicitly from
+  `ownerCusId` (already in scope from line 104) when `msg.fromMe` is true.
+  Without this fix, `from_jid` may be empty or wrong for Nick's own rows,
+  which complicates future per-sender filtering of the archive.
 
-- **No `tasks/main/implementation-notes.md` exists**: The spec in both tasks required TDD mode and non-trivial architectural additions (new fuzzy module, config I/O, integration into index.ts). Implementation notes documenting decisions (e.g., dice vs Levenshtein, double `ensureDailyReset` call in `recordAmbientReply+index.ts`, why rate-limit runs after ambient gate instead of before) would help future reviewers/implementers calibrate. Not a blocker for this ship, but flag for future tasks.
+- **`src/prompts.ts:224` (`fillTemplate`)**: `String.prototype.replace`
+  interprets `$&`, `$1`-`$9`, `$$` in the replacement string. The
+  `MESSAGES` and `GROUP_NAME` vars now carry raw user-generated content
+  from WhatsApp (group name, message bodies). A message containing a
+  literal `$&` would be replaced with `{MESSAGES}`, and `$$` collapses to
+  `$`. This is a pre-existing hazard in fillTemplate that was
+  previously safe because all inputs were trusted; the summary feature is
+  the first to pipe arbitrary user text through it. Either escape `$`
+  runs in values (`replace(/\$/g, '$$$$')`) or use a function-replacement
+  form. Will not break any test here — just silently mangles certain
+  messages in summaries.
+
+- **`src/commands.test.ts:769` ("happy path" test)**: the stub claude
+  command echoes a fixed "Summary!" regardless of what the prompt
+  contains. The test verifies the reply contains "Summary!" but does NOT
+  verify that the prompt was constructed correctly (that the seeded
+  messages were formatted into `[HH:MM] <name>: <body>` lines, that
+  `(me)` suffix was applied for Nick's row, or that GROUP_NAME/DATE were
+  substituted). A regression that broke message formatting or the
+  `(me)` annotation would pass this test. Consider capturing the stdin
+  that the subprocess receives (write it to a temp file via
+  `process.stdin.pipe(fs.createWriteStream(...))` in the stub) and
+  asserting the formatted lines appear there.
+
+- **`src/groups.test.ts:319` (`localDate` test)**: the assertion only
+  checks `result.startsWith('2026-04-')` and that it matches
+  `^\d{4}-\d{2}-\d{2}$`. This passes even if `localDate` returned the
+  UTC date by mistake — the whole point of the function is that it must
+  NOT return the UTC date. For a mid-day UTC timestamp the local date
+  will usually also be `2026-04-18`, so this is not a strong test.
+  Consider: pass a timestamp near UTC midnight (e.g.
+  `2026-04-18T23:30:00Z`) and assert the result differs from
+  `new Date(tsMs).toISOString().slice(0,10)` when the test machine's
+  offset moves the local day forward.
 
 ### Minor (nice to fix)
 
-- **`src/commands.ts:465-472`**: `!topic add <existing>` replies `ok, added ${phrase}` even when the phrase was already in the list. User-facing message is slightly misleading — something like `ok, ${phrase} already in list. total: N` would be more accurate. (Task 02 test #13 only asserts that duplicates are not added — not the reply wording.)
+- **`src/index.ts:197`**: `SYSTEM_TYPES` is re-allocated on every group
+  message. Move to module scope. (The set also includes `revoked` and
+  `call_log` beyond the spec's five; this is reasonable — a deleted-
+  message notification has no archival value — but worth a comment
+  explaining the deviation.)
 
-- **`src/index.ts:369`**: `recordAmbientReply(ensureDailyReset(loadAmbientConfig()))` — `recordAmbientReply` itself calls `ensureDailyReset` internally (see `ambient.ts:224`), so the outer `ensureDailyReset` is redundant. Harmless but untidy.
+- **`src/index.ts:222`/`234`**: `localDate(tsMs)` is called twice (once
+  for the `local_date` field, once for the debug log). Compute once and
+  reuse.
 
-- **`src/index.ts:266-276`**: The silence check fires AFTER the ambient gate. A chat muted via `!silence` will still trigger topic-bank build + `ambient.considered` event before being rejected at the silence check. For correctness this is fine (and matches spec intent — ambient is still gated by silence), but it means the `ambient.considered` event count in stats can over-count for muted chats. Consider moving the silence check before the ambient gate, or adding a pre-check to skip ambient when silenced.
+- **`src/groups.ts:83`**: The second `replace(/[^a-z0-9-]/g, '-')` pass
+  after the whitespace step is worth a comment — `normalize()` preserves
+  Unicode letters (`\p{L}`) but slugify wants ASCII-only folder names,
+  and this line is what strips e.g. Chinese characters. Currently reads
+  as "residual" which undersells its role.
 
-- **`src/commands.ts:433-443`**: `!ambient refresh` reply is `ok, refreshed: voice=<n> memory=<m> total=<k>` — spec specified `ok, refreshed: voice=<n> memory=<m>`. The added `total=` is harmless but a small spec deviation.
+- **`src/commands.ts:556` (`cmdSummary`)**: no test for the "null
+  parseDateSpec → usage error" branch (e.g. `!summary mgz foobar`). The
+  code path is live but untested.
 
-- **`src/prompts.test.ts`**: No test for `AMBIENT_PROMPT_PREFIX` or `VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT` — a simple smoke test that the `{VOICE_PROFILE}` placeholder fills without orphans would catch regressions if the template structure changes.
+- **`src/commands.ts:595` ("no messages" reply)**: the reply format is
+  `no messages for ${match.name} on ${targetDate}`. Spec phrasing is
+  `"no messages for <group> on <date>"` — matches. Fine.
 
-- **`src/commands.ts:111-122`**: `HELP_TEXT` constant lists new commands — good. But commands.test.ts:78-89 (`dispatchCommand — !help`) doesn't assert that `!ambient` or `!topic` appear, so a regression that drops them from help wouldn't be caught. Low-risk gap.
+- **`src/index.ts:230`**: `quoted_id` is always `null` even when
+  `has_quoted: true`. Noted in task spec as `quoted_id: null` in the
+  example record, so spec-conformant, but it means summaries cannot link
+  quoted messages. If that's desired later, an `await msg.getQuotedMessage()`
+  with timeout + fallback would be the path.
 
-- **`src/ambient.ts:282`**: `maybeRefreshVoiceProfileTopics` catches the `statSync` error with `catch {}` and returns `{ refreshed: false, count: 0 }` for any error (not just ENOENT). If permissions/IO fail for reasons other than "file missing", the user gets no warning. Consider differentiating ENOENT from other errors, matching the pattern in `loadMemoryTopics` (line 115).
+- **`src/groups.ts:264` (`findGroupsByName`)**: no upper bound on number
+  of matches returned. For an index with ~50 groups and a short query
+  that fuzzy-matches many (e.g. single character), the reply could be
+  spammy. Not a bug — just a consideration for later.
+
+- **`tasks/main/implementation-notes.md`**: does not exist. Both tasks
+  made some non-obvious choices (SYSTEM_TYPES superset, reusing
+  `fuzzy.normalize()` plus a second ASCII pass in slugify, choosing
+  `toLocaleDateString('en-CA')` over manual assembly). A short notes
+  file would help the next reviewer.
 
 ## What Looks Good
 
-- **Gate ordering**: `shouldAmbientReply` implements the 6 gates in exactly the documented order. Tests cover each failure branch (master, disabledGroups, cap, short, empty-bank, no-match) and the happy path.
-- **Default safety**: `masterEnabled: false` in `defaultAmbientConfig()` and persists from the shipped path. `loadAmbientConfig` returns defaults on both missing-file and malformed-JSON. Test coverage for both.
-- **Atomic writes**: `saveAmbientConfig` uses `tmp-<pid>-<ts>` + `renameSync`. Test `saveAmbientConfig atomic write` checks no `.tmp-` files remain.
-- **Chat-name normalization**: `normalizeChatKey` (`.trim().toLowerCase()`) used consistently in both `shouldAmbientReply` (comparing stored group key against incoming chat name) and all `!ambient on/off <chat>` command paths. `ambient.test.ts` covers the mixed-case case at line 259-268. `commands.test.ts` covers at test #4.
-- **Rate-limit and silence**: existing per-group 10s rate limit applies uniformly to ambient (reuses `lastReplyAt` map) — correct reuse of existing infrastructure.
-- **Ambient prompt prefix**: Prepended ONLY when trigger is `'ambient'`; `RUNTIME_PROMPT` structure is not modified. The prefix explicitly forbids "falando nisso" / "just saw this" and instructs Claude that empty output is the right answer most of the time.
-- **Trigger union extension**: Cleanly extended `'mention' | 'reply' | null` to `'mention' | 'reply' | 'ambient' | null` throughout the handler with no type-errors.
-- **Event kinds**: All 5 new event kinds added as pure union additions — no existing event code touched.
-- **Claude extraction via existing pattern**: `extractVoiceProfileTopics` uses the `_config.command` swap pattern from `claude.test.ts` for deterministic test output, avoiding real subprocess calls.
-- **Mtime-gated refresh**: `maybeRefreshVoiceProfileTopics` only re-runs claude when the voice profile's mtime changed, which avoids unnecessary API calls.
-- **Command structure**: `dispatchCommand` catches and logs errors uniformly; commands never throw out of the handler.
+- `src/groups.ts` is tidy, well-commented, and isolates each concern
+  into a single function. Reuse of `normalize()` and `diceSimilarity()`
+  from `src/fuzzy.ts` is exactly right.
+- Atomic write of `.index.json` via tmp+rename matches the established
+  `memory.ts` pattern.
+- Handler ordering in `src/index.ts` is correct: persist runs AFTER
+  `getChat()` (necessary — we need `chat.name` and `chat.id`), AFTER the
+  `isGroup` check, BEFORE the `fromMe` gate (so Nick's own messages are
+  archived for complete summaries), and is wrapped in try/catch so a
+  persist failure cannot break the rest of the handler.
+- System-message filtering uses `msg.type`, not a heuristic on body —
+  robust.
+- JSONL newline-terminated append means partial-write on power loss
+  leaves a trailing malformed line that the reader skips gracefully.
+  The reader warns once per invocation rather than per-line, which is
+  good.
+- `parseDateSpec` is a pure function with clean semantics; tests cover
+  today/undefined/empty/yesterday/Nd/ISO/invalid.
+- `.gitignore` entry for `data/groups/` is in place. Nothing group-
+  related leaks into the staging area.
+- `README.md` section matches the spec prose closely.
+- `!summary` event-log surface is complete: `requested`, `no_match`,
+  `multi_match`, `empty`, `generated` (with `msg_count` and
+  `duration_ms`), `error` (with `reason`). Good observability.
 
 ## Test Coverage
 
 | Area | Tests Exist | Coverage Notes |
 |------|-------------|----------------|
-| `fuzzy.normalize` | Yes | Lowercase, diacritics, punctuation, whitespace — all 4 spec cases covered |
-| `fuzzy.diceSimilarity` | Yes | Identical, disjoint, similar, case-insensitive |
-| `fuzzy.bestFuzzyMatch` | Yes | Top match, threshold respect, empty bank, empty body, fuzzy typo, threshold=0 |
-| `ambient.defaultAmbientConfig`/load/save | Yes | Defaults, malformed JSON, round-trip, atomic write |
-| `ambient.ensureDailyReset` | Yes | New day, same day |
-| `ambient.loadMemoryTopics` | Yes | Multi-file merge+dedupe, empty dir, files without section |
-| `ambient.buildTopicBank` | Yes | Merge, dedupe |
-| `ambient.shouldAmbientReply` | Yes | All 6 gate failures + happy path + chat normalization |
-| `ambient.recordAmbientReply` | Yes | Append timestamp, daily reset trigger |
-| `ambient.extractVoiceProfileTopics` | Yes | Parse, dedupe, cap 20, missing file, claude fails |
-| `!ambient on/off` | Yes | master flags, normalization |
-| `!ambient off <chat>` | Yes | Normalization, add/remove from disabledGroups |
-| `!ambient status` | Partial | Only asserts keywords — does NOT catch arithmetic bug |
-| `!ambient cap/threshold` | Yes | Valid + invalid input both tested |
-| `!ambient refresh` | No | No unit test for the sub-command (extractor itself is tested) |
-| `!topic add/remove/list` | Yes | Add, normalize, dedupe, remove missing, list all sources |
-| `AMBIENT_PROMPT_PREFIX` prepended on ambient trigger | No | No integration test; relies on visual code review |
-| Ambient path filters + emits correct events | No | No integration test; structural correctness verified by inspection |
-| Rate-limit applies to ambient | No | Not explicitly tested; relies on shared code path |
+| `slugifyGroupName` | Yes (7 cases) | Plain, spaces, diacritics, emojis, fallback, collapse, trim |
+| Index I/O (`loadGroupIndex`/`saveGroupIndex`) | Yes (4 cases) | Missing, malformed, roundtrip, no tmp leftover |
+| `ensureGroupFolder` | Yes (4 cases) | New, cached, 2-collision, 3-collision |
+| `persistMessage` + `readDayMessages` | Yes (6 cases) | Single, multiple, different days, malformed skip, permission error, missing file |
+| `listDays` | Yes (3 cases) | Empty folder, missing folder, 3 files desc |
+| `findGroupsByName` | Yes (4 cases) | Empty index, exact, fuzzy, no match, plus sort-desc |
+| `localDate` | Partial | Format only — does NOT verify local vs UTC behavior in a TZ-sensitive way |
+| `parseDateSpec` | Yes (7 cases) | today, undefined, empty, yesterday, Nd, ISO, invalid |
+| `cmdSummary` | Yes (9 cases) | No args, no match, ambiguous, empty day, happy path, yesterday, Nd, ISO date, claude error |
+| Persist hook in `src/index.ts` | No (explicit out-of-scope per task-02 note) | Would require a whatsapp-web.js mock |
 
-**Test Coverage Assessment**: Core pure-logic modules (fuzzy, ambient gate, config I/O, memory parsing, extractor) are thoroughly tested. Command handlers well covered. Runtime integration tests are absent — acceptable given `src/index.ts` has never had a full integration test (the existing `index.test.ts` only covers pure helpers), but the ambient-specific event emissions and rate-limit/ambient interplay would benefit from at least one integration test in the future.
+**Test Coverage Assessment**: Thorough. The one weak spot is
+`localDate` — its test does not catch a regression where the function
+accidentally returns the UTC date. Happy path `cmdSummary` test passes
+against a stub that ignores the prompt, so it verifies the wiring but
+not the prompt construction. Both are Important-level fixes, not
+blockers.
 
 ## Test Execution
 
 | Check | Result | Details |
 |-------|--------|---------|
-| Test command discovered | Yes (`npm test` → `vitest run`) | From `package.json:11` |
-| Test suite run | Passed (196/196) | 12 test files pass; pre-existing puppeteer `Unhandled Rejection` from `index.test.ts` running full main() is unrelated to this change |
-| TDD evidence in implementation notes | N/A | `implementation-notes.md` is absent; the code structure + test-first names (e.g., numbered test comments matching spec) indicate TDD was likely followed |
+| Test command discovered | Yes (`npm test`) | `package.json` `scripts.test` = `vitest run` |
+| Test suite run | Passed (248/248) | 13 test files, ~700ms |
+| TDD evidence in implementation notes | N/A | `implementation-notes.md` not present |
 
-**Test Execution Assessment**: All 196 tests pass. Build is clean. The pre-existing unhandled puppeteer rejection is unrelated to the ambient feature (it's from `index.test.ts` importing `./index` which has a side effect of `main().catch(...)` at module top-level — this predates this batch of changes).
+One unrelated unhandled rejection from `src/index.test.ts` — it imports
+`./index` which auto-runs `main()` at module load (tries to create a
+Puppeteer browser). Pre-existing; not introduced by these changes.
+Doesn't affect test results — 248/248 still pass.
+
+**Test Execution Assessment**: Clean run, all green, tsc clean.
 
 ## TDD Compliance
 
 | Task | Tests Written | Tests Adequate | TDD Skipped Reason Valid | Notes |
 |------|---------------|---------------|-------------------------|-------|
-| task-01-ambient-infra | Yes | Yes | N/A | All 13 fuzzy cases + all 18 ambient cases from spec present |
-| task-02-ambient-integration | Yes | Yes | N/A | All 16 command cases + 5 extractor cases present |
+| task-01-groups-persistence | Yes (29 cases in `groups.test.ts`) | Yes (28/29 meaningful) | N/A | `localDate` test is weak — see Important issue above |
+| task-02-summary-integration | Yes (16 new cases in `commands.test.ts`: 7 `parseDateSpec` + 9 `cmdSummary`) | Yes (15/16 meaningful) | N/A | `!summary` happy path verifies reply but not prompt construction — see Important issue |
 
-**TDD Assessment**: Tests map tightly to spec-enumerated test cases (numbered 1–18 for ambient, 1–16 for commands, 17–21 for extractor). Tests call real code, real fs, real dice scorer; mocking is kept at the system boundary (the claude subprocess via `_config.command`), which matches this project's conventions.
+**TDD Assessment**: Tests cover the acceptance criteria comprehensively.
+Mocking discipline is good: no fs mocks (real temp dirs via
+`mkdtempSync` + `process.chdir`), no mocks of modules under test. The
+single use of `vi.spyOn(fs, 'appendFileSync')` is specifically to
+simulate a permission error — that's the boundary being exercised, so
+it's fine.
 
-**Test Adequacy**: 42/44 tests are meaningful and specific. 2 tests flagged as weak:
-- `commands.test.ts:484-492` (`!ambient status`) only asserts that `master`/`cap`/`threshold` substrings appear. Does not check the `memory:` count is non-negative or numerically correct — this is how the arithmetic bug at `commands.ts:403` slipped through.
-- `commands.test.ts:78-89` (`!help`) does not assert `!ambient` or `!topic` appear — a regression that drops them from help would not be caught.
-
-Other tests use real assertions with specific expected values (`toBe`, `toEqual`, `toContain`, numeric comparisons). Mocking discipline is correct: only `_config.command` (system boundary) is swapped in extractor tests; no internal modules are mocked.
-
-## Plan Review
-
-### Dependency Graph
-
-| Task | Depends On | Status |
-|------|-----------|--------|
-| task-01-ambient-infra | None | Valid |
-| task-02-ambient-integration | task-01 | Valid |
-
-**Dependency Assessment**: No issues found. Task 02 correctly declares dependency on Task 01 (it needs the exports from `src/ambient.ts`, `src/fuzzy.ts`, and the new prompt + event additions). No circular deps; no phantom refs.
-
-### PRD Coverage
-
-| PRD Requirement | Covered By | Status |
-|----------------|-----------|--------|
-| Fuzzy match (threshold, not substring) | task-01 + implementation | Covered |
-| Hybrid topic source (explicit + voice + memory) | task-01 | Covered |
-| Daily cap (default 30, adjustable via !ambient cap) | task-01 + task-02 | Covered |
-| Per-group rate limit still applies (reuse lastReplyAt) | task-02 | Covered |
-| No hardcoded reply prefix (voice profile governs) | task-01 (AMBIENT_PROMPT_PREFIX) | Covered |
-| `!ambient on` = global, `!ambient off <chat>` = blocklist | task-02 | Covered |
-| Off by default | task-01 (defaultAmbientConfig) | Covered |
-| `!ambient refresh` rebuilds voice + memory | task-02 | Covered |
-| `!topic` add/remove/list | task-02 | Covered |
-| Ambient uses AMBIENT_PROMPT_PREFIX + RUNTIME_PROMPT | task-02 | Covered |
-| `ambient.skipped`/`considered`/`replied`/`declined` events | task-01 (enum) + task-02 (wiring) | Covered |
-| README updated with ambient section | task-02 | Covered |
-
-**Coverage Score**: 12/12 requirements covered
-
-### File Conflict Analysis
-
-| File | Tasks Touching It | Conflict? |
-|------|------------------|-----------|
-| `src/fuzzy.ts` | task-01 | No conflict (new file, single task) |
-| `src/ambient.ts` | task-01, task-02 | Ordered (task-02 depends on task-01) |
-| `src/ambient.test.ts` | task-01, task-02 | Ordered (task-02 appends extractor tests) |
-| `src/prompts.ts` | task-01 | No conflict (single task adds exports) |
-| `src/events.ts` | task-01 | No conflict (single task adds enum values) |
-| `src/commands.ts` | task-02 | No conflict |
-| `src/commands.test.ts` | task-02 | No conflict |
-| `src/index.ts` | task-02 | No conflict |
-| `README.md` | task-02 | No conflict |
-| `.gitignore` | task-01 | No conflict |
-
-**Conflict Assessment**: No conflicts detected.
-
-### Task Sizing
-
-| Task | Assessment | Notes |
-|------|-----------|-------|
-| task-01-ambient-infra | Well-sized | 5 files, clear scope (pure-logic foundation), self-contained |
-| task-02-ambient-integration | Well-sized | 6 files, builds on task-01, scope is runtime wiring + commands + README |
-
-### TDD Spec Consistency
-
-| Task | Has TDD Section | Framework Valid | Command Valid | Status |
-|------|----------------|-----------------|--------------|--------|
-| task-01-ambient-infra | Yes | Yes (Vitest) | Yes (`npm test`) | OK |
-| task-02-ambient-integration | Yes | Yes (Vitest) | Yes (`npm test`) | OK |
-
-**TDD Spec Assessment**: Both tasks reference Vitest (correct — used throughout repo) and `npm test` (correct — matches package.json). Test file paths (`src/fuzzy.test.ts`, `src/ambient.test.ts`, `src/commands.test.ts`) follow the project's colocation convention.
-
-### Plan Issues Found
-
-#### Critical (blocks implementation)
-- None
-
-#### Important (should fix before proceeding)
-- None
-
-#### Minor (nice to fix)
-- None
+**Test Adequacy**: 43/45 tests are meaningful and specific. 2 flagged
+as weak (listed under Important): `localDate` format-only assertion,
+and `cmdSummary` happy path that doesn't verify prompt contents.
 
 ## Implementation Decision Review
 
 | Task | Decisions Documented | Decisions Sound | Flags |
 |------|---------------------|----------------|-------|
-| task-01-ambient-infra | No (no implementation-notes.md) | Yes (from code) | None |
-| task-02-ambient-integration | No (no implementation-notes.md) | Yes (from code) | None |
+| task-01 | No (no implementation-notes.md) | Mostly yes | Non-obvious: reuse `normalize()` + second ASCII pass; `toLocaleDateString('en-CA')` choice; counter loop starting at 2 |
+| task-02 | No | Mostly yes | SYSTEM_TYPES superset (`revoked`/`call_log` beyond spec); `SYSTEM_TYPES` allocated per-message |
 
-**Decision Assessment**: No `implementation-notes.md` exists — the implementer did not document reasoning. Based on code inspection, decisions look sound: dice bigram is a standard choice for fuzzy matching, `_config.command` swap for extractor tests matches the existing project convention, mtime-gated voice profile refresh avoids unnecessary claude calls, and the trigger union was extended rather than overloaded. The one arithmetic bug in `!ambient status` (memory count via subtraction) suggests the implementer did not test manually after shipping — a quick `!ambient status` run would have surfaced the negative count.
+**Decision Assessment**: The engineering decisions are all reasonable
+and follow the codebase's existing conventions (atomic writes, cwd-
+relative paths, pure helpers with tests in the same file). The absence
+of `implementation-notes.md` is a Minor issue — not blocking, but a
+future reviewer would benefit from a note on the SYSTEM_TYPES superset
+and the slugify dual-pass strategy.
 
 ## Recommendations
 
-1. **Fix the `!ambient status` memory count arithmetic** (`src/commands.ts:403`). Use `loadMemoryTopics().length` directly instead of subtracting from the deduped bank. Add a test that asserts the count is non-negative with overlapping sources.
-2. **Improve `!topic add` duplicate reply wording** so users know when a phrase was already present.
-3. **Remove the redundant `ensureDailyReset` call** in `src/index.ts:369` (the wrapped `recordAmbientReply` already does it).
-4. **Optionally**: add a smoke test for `AMBIENT_PROMPT_PREFIX` in `prompts.test.ts`, and assert that `!ambient`/`!topic` appear in `!help` output in `commands.test.ts`.
-5. **Future**: add an `implementation-notes.md` for this batch documenting why dice bigram (vs Levenshtein) was chosen, why `_config.command` swap is used for extractor tests, and the design choice of running the silence gate after the ambient gate rather than before.
+1. **Fix `from_jid` for Nick's own messages** (`src/index.ts:209-213`):
+   when `msg.fromMe`, set `fromJid = ownerCusId` explicitly.
+2. **Escape `$` runs in `fillTemplate` values** (`src/prompts.ts:227`):
+   either `vars[key].replace(/\$/g, '$$$$')` or use the function-
+   replacement form. This prevents user-generated content in message
+   bodies from silently mangling summary prompts.
+3. **Strengthen the `localDate` test** with a near-midnight-UTC
+   timestamp that flips days under at least one plausible local TZ.
+4. **Strengthen the `!summary` happy-path test** to verify prompt
+   construction (capture stdin that the stub claude receives; assert
+   the message lines and `(me)` suffix are present).
+5. **Move `SYSTEM_TYPES` to module scope** in `src/index.ts`.
+6. **Add a short `tasks/main/implementation-notes.md`** documenting
+   the SYSTEM_TYPES superset, the slugify dual-pass, and the
+   `toLocaleDateString('en-CA')` choice.
+7. (Optional) Cap `findGroupsByName` results to some sane number
+   (10?) to bound the "multi match" reply length.

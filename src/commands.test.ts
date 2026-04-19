@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { parseCommand, dispatchCommand, normalizeChatKey, type CommandContext } from './commands';
+import { parseCommand, dispatchCommand, normalizeChatKey, parseDateSpec, type CommandContext } from './commands';
+import { _config } from './claude';
+import { ensureGroupFolder, persistMessage, localDate } from './groups';
 
 // ---- Helpers ----------------------------------------------------------------
 
@@ -629,5 +631,230 @@ describe('dispatchCommand — !ambient and !topic', () => {
     expect(text).toContain('crypto');
     expect(text).toMatch(/memory/i);
     expect(text).toContain('startups');
+  });
+});
+
+// ---- parseDateSpec ----------------------------------------------------------
+
+describe('parseDateSpec', () => {
+  it('returns today for "today"', () => {
+    const expected = localDate(Date.now());
+    expect(parseDateSpec('today')).toBe(expected);
+  });
+
+  it('returns today for undefined', () => {
+    const expected = localDate(Date.now());
+    expect(parseDateSpec(undefined)).toBe(expected);
+  });
+
+  it('returns today for empty string', () => {
+    const expected = localDate(Date.now());
+    expect(parseDateSpec('')).toBe(expected);
+  });
+
+  it('returns yesterday for "yesterday"', () => {
+    const yesterdayMs = Date.now() - 24 * 60 * 60 * 1000;
+    const expected = localDate(yesterdayMs);
+    expect(parseDateSpec('yesterday')).toBe(expected);
+  });
+
+  it('returns 3 days ago for "3d"', () => {
+    const ms = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const expected = localDate(ms);
+    expect(parseDateSpec('3d')).toBe(expected);
+  });
+
+  it('returns exact date for YYYY-MM-DD format', () => {
+    expect(parseDateSpec('2026-04-15')).toBe('2026-04-15');
+  });
+
+  it('returns null for unrecognized format', () => {
+    expect(parseDateSpec('not-a-date')).toBeNull();
+  });
+});
+
+// ---- dispatchCommand — !summary ---------------------------------------------
+
+describe('dispatchCommand — !summary', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+  let originalCommand: string;
+  let originalArgs: string[];
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    originalCommand = _config.command;
+    originalArgs = [..._config.args];
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'commands-summary-test-'));
+    // Set up directory structure required by groups and events
+    fs.mkdirSync(path.join(tmpDir, 'data', 'contacts'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'data', 'groups'), { recursive: true });
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    _config.command = originalCommand;
+    _config.args = originalArgs;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // Helper: write a group with messages into the temp cwd
+  function seedGroup(groupName: string, jid: string, date: string, messages: Array<{ from_name: string; body: string; from_me?: boolean }>) {
+    ensureGroupFolder(jid, groupName);
+    for (const m of messages) {
+      const tsMs = new Date(`${date}T12:00:00.000Z`).getTime();
+      persistMessage({
+        chatJid: jid,
+        chatName: groupName,
+        msg: {
+          ts: new Date(tsMs).toISOString(),
+          local_date: date,
+          from_jid: m.from_me ? '' : `${m.from_name.toLowerCase()}@c.us`,
+          from_name: m.from_name,
+          body: m.body,
+          from_me: !!m.from_me,
+          type: 'chat',
+          id: `id-${Math.random()}`,
+          has_quoted: false,
+          quoted_id: null,
+        },
+      });
+    }
+  }
+
+  // Test 7: !summary with no args → reply contains "usage" or "missing"
+  it('!summary with no args replies with usage hint', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary')!, ctx);
+    expect(replies[0]).toMatch(/usage|missing/i);
+  });
+
+  // Test 8: !summary <non-existent> → reply "no group matching ..."
+  it('!summary <non-existent> replies "no group matching"', async () => {
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary asdfxyz')!, ctx);
+    expect(replies[0]).toMatch(/no group matching/i);
+  });
+
+  // Test 9: !summary <ambiguous> → reply lists both groups
+  it('!summary <ambiguous> with two matching groups lists candidates', async () => {
+    // Use group names that score >= 0.4 with the query "chat"
+    // diceSimilarity("chat", "chat alpha") ≈ 0.5, ("chat", "chat beta") ≈ 0.55
+    ensureGroupFolder('111@g.us', 'chat alpha');
+    ensureGroupFolder('222@g.us', 'chat beta');
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary chat')!, ctx);
+    // Both groups should be listed or reply should indicate multiple matches
+    expect(replies[0]).toMatch(/multiple|ambiguous|matches/i);
+    expect(replies[0]).toMatch(/chat alpha|chat beta/i);
+  });
+
+  // Test 10: !summary mgz with empty JSONL → reply "no messages for mgz on <today>"
+  it('!summary with empty JSONL for today replies "no messages"', async () => {
+    ensureGroupFolder('mgz-test@g.us', 'mgz');
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz')!, ctx);
+    expect(replies[0]).toMatch(/no messages/i);
+  });
+
+  // Test 11: !summary mgz with 2 messages — stub echoes stdin so we can verify
+  // prompt construction: [HH:MM] Name: body lines must be present, (me) suffix
+  // for fromMe messages must appear. A regression in message formatting or the
+  // (me) annotation will make this test fail.
+  it('!summary with messages uses claude and returns summary with correct prompt formatting', async () => {
+    const today = localDate(Date.now());
+    seedGroup('mgz', 'mgz-jid@g.us', today, [
+      { from_name: 'Alice', body: 'first body' },
+      { from_name: 'Nick', body: 'second body', from_me: true },
+    ]);
+
+    // Stub claude to echo its stdin back as output so we can inspect the prompt
+    _config.command = 'node';
+    _config.args = ['-e', `
+      let buf = '';
+      process.stdin.on('data', c => buf += c);
+      process.stdin.on('end', () => process.stdout.write(buf));
+    `];
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz')!, ctx);
+    const reply = replies[0];
+    // Verify the [HH:MM] Name: body structure for the non-fromMe message
+    expect(reply).toMatch(/\[\d{2}:\d{2}\] Alice: first body/);
+    // Verify the (me) marker is present for Nick's fromMe message
+    expect(reply).toMatch(/\[\d{2}:\d{2}\] Nick: second body \(me\)/);
+  });
+
+  // Test 12: !summary mgz yesterday reads yesterday's file (not today's)
+  it('!summary mgz yesterday reads yesterday file', async () => {
+    const yesterday = localDate(Date.now() - 24 * 60 * 60 * 1000);
+    seedGroup('mgz', 'mgz-jid@g.us', yesterday, [
+      { from_name: 'Alice', body: 'yesterday message' },
+    ]);
+
+    _config.command = 'node';
+    _config.args = ['-e', 'process.stdin.on("data",()=>{}); process.stdin.on("end", ()=> console.log("YesterdaySummary"))'];
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz yesterday')!, ctx);
+    expect(replies[0]).toContain('YesterdaySummary');
+  });
+
+  // Test 13: !summary mgz 2d reads file from 2 days ago
+  it('!summary mgz 2d reads file from 2 days ago', async () => {
+    const twoDaysAgo = localDate(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    seedGroup('mgz', 'mgz-jid@g.us', twoDaysAgo, [
+      { from_name: 'Alice', body: '2d message' },
+    ]);
+
+    _config.command = 'node';
+    _config.args = ['-e', 'process.stdin.on("data",()=>{}); process.stdin.on("end", ()=> console.log("TwoDaysSummary"))'];
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz 2d')!, ctx);
+    expect(replies[0]).toContain('TwoDaysSummary');
+  });
+
+  // Test 14: !summary mgz 2026-04-15 reads that exact date's file
+  it('!summary mgz 2026-04-15 reads that exact date', async () => {
+    seedGroup('mgz', 'mgz-jid@g.us', '2026-04-15', [
+      { from_name: 'Alice', body: 'April 15 message' },
+    ]);
+
+    _config.command = 'node';
+    _config.args = ['-e', 'process.stdin.on("data",()=>{}); process.stdin.on("end", ()=> console.log("AprilSummary"))'];
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz 2026-04-15')!, ctx);
+    expect(replies[0]).toContain('AprilSummary');
+  });
+
+  // Test 15: !summary mgz when claude subprocess errors → reply contains "summary failed"
+  it('!summary when claude errors replies "summary failed"', async () => {
+    const today = localDate(Date.now());
+    seedGroup('mgz', 'mgz-jid@g.us', today, [
+      { from_name: 'Alice', body: 'a message' },
+    ]);
+
+    // Make claude exit with non-zero code
+    _config.command = 'node';
+    _config.args = ['-e', 'process.exit(1)'];
+
+    const replies: string[] = [];
+    const ctx = makeCtx(replies, new Map());
+    await dispatchCommand(parseCommand('!summary mgz')!, ctx);
+    expect(replies[0]).toMatch(/summary failed/i);
   });
 });

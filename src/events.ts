@@ -24,7 +24,14 @@ export type EventKind =
   | 'ambient.considered'
   | 'ambient.replied'
   | 'ambient.declined'
-  | 'skip.ambient_disabled';
+  | 'skip.ambient_disabled'
+  | 'group.persisted'
+  | 'summary.requested'
+  | 'summary.no_match'
+  | 'summary.multi_match'
+  | 'summary.empty'
+  | 'summary.generated'
+  | 'summary.error';
 
 export interface EventBase {
   ts: string;

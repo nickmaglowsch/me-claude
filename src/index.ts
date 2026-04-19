@@ -13,6 +13,7 @@ import { RUNTIME_PROMPT, AMBIENT_PROMPT_PREFIX, fillTemplate } from './prompts';
 import { resolveToCus } from './memory';
 import { logEvent } from './events';
 import { parseCommand, dispatchCommand, normalizeChatKey } from './commands';
+import { ensureGroupFolder, persistMessage, localDate } from './groups';
 import {
   loadAmbientConfig,
   saveAmbientConfig,
@@ -188,6 +189,54 @@ async function main(): Promise<void> {
         dbg(`skip: not a group (${chat.name ?? chat.id?._serialized})`);
         logEvent({ kind: 'skip.not_in_group', chat: chat.name ?? chat.id?._serialized });
         return;
+      }
+
+      // Archive every group message for summary/search. Errors are swallowed
+      // inside persistMessage; no gating here.
+      // Skip system messages that have no conversational content.
+      const SYSTEM_TYPES = new Set([
+        'e2e_notification',
+        'notification',
+        'notification_template',
+        'gp2',
+        'group_notification',
+        'revoked',
+        'call_log',
+      ]);
+      if (!SYSTEM_TYPES.has(msg.type)) {
+        try {
+          const folder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
+          const contact = msg.fromMe
+            ? undefined
+            : await msg.getContact().catch(() => undefined);
+          const fromJid = (msg.fromMe
+            ? ownerCusId
+            : (contact?.id?._serialized ?? msg.author ?? msg.from ?? '')) as string;
+          const fromName = contact?.pushname || contact?.number || (msg.fromMe ? 'Nick' : 'Unknown');
+          const tsMs = (msg.timestamp ?? Math.floor(Date.now() / 1000)) * 1000;
+          const body = msg.type === 'chat' ? (msg.body ?? '') : `[${msg.type}]`;
+
+          persistMessage({
+            chatJid: chat.id._serialized,
+            chatName: chat.name ?? '',
+            msg: {
+              ts: new Date(tsMs).toISOString(),
+              local_date: localDate(tsMs),
+              from_jid: fromJid,
+              from_name: fromName,
+              body,
+              from_me: !!msg.fromMe,
+              type: msg.type ?? 'unknown',
+              id: msg.id?._serialized ?? '',
+              has_quoted: !!msg.hasQuotedMsg,
+              quoted_id: null,
+            },
+          });
+          logEvent({ kind: 'group.persisted', chat_id: chat.id._serialized, chat: chat.name, msg_type: msg.type });
+          dbg(`persisted to ${folder}/${localDate(tsMs)}`);
+        } catch (e) {
+          dbg(`persist error: ${(e as Error).message}`);
+        }
       }
 
       // Gate 2: must not be our own message

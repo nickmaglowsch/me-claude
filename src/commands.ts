@@ -12,6 +12,9 @@ import {
   loadMemoryTopics,
   maybeRefreshVoiceProfileTopics,
 } from './ambient';
+import { findGroupsByName, readDayMessages, localDate } from './groups';
+import { callClaude } from './claude';
+import { SUMMARY_PROMPT, fillTemplate } from './prompts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -119,7 +122,8 @@ const HELP_TEXT = `Commands available:
   !ambient on|off [chat]         — enable/disable ambient replies globally or per-chat
   !ambient status|cap|threshold  — show or change ambient config
   !ambient refresh               — re-extract topics from voice profile + memory
-  !topic add|remove|list <phrase> — manage the fuzzy-match topic bank`;
+  !topic add|remove|list <phrase> — manage the fuzzy-match topic bank
+  !summary <group> [date]        — Summarize a group's day. date: today | yesterday | Nd | YYYY-MM-DD`;
 
 // ---------------------------------------------------------------------------
 // Command handlers
@@ -510,6 +514,128 @@ async function cmdTopic(parsed: ParsedCommand, ctx: CommandContext): Promise<voi
 }
 
 // ---------------------------------------------------------------------------
+// parseDateSpec
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse user's date spec into a local YYYY-MM-DD string.
+ * Accepts: "today" | undefined | "" → today
+ *          "yesterday"              → yesterday
+ *          /^\d+d$/                 → N days ago
+ *          /^\d{4}-\d{2}-\d{2}$/   → exact date
+ * Returns null if unrecognized.
+ */
+export function parseDateSpec(raw?: string): string | null {
+  const s = (raw ?? '').trim();
+
+  if (!s || s === 'today') {
+    return localDate(Date.now());
+  }
+
+  if (s === 'yesterday') {
+    return localDate(Date.now() - 24 * 60 * 60 * 1000);
+  }
+
+  const ndMatch = s.match(/^(\d+)d$/);
+  if (ndMatch) {
+    const n = parseInt(ndMatch[1], 10);
+    return localDate(Date.now() - n * 24 * 60 * 60 * 1000);
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return s;
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// !summary command handler
+// ---------------------------------------------------------------------------
+
+async function cmdSummary(parsed: ParsedCommand, ctx: CommandContext): Promise<void> {
+  logEvent({ kind: 'summary.requested' });
+
+  const groupQuery = parsed.argv[0];
+  if (!groupQuery) {
+    await ctx.reply('usage: !summary <group> [date]   e.g. !summary mgz yesterday');
+    return;
+  }
+
+  // Parse optional date spec (argv[1..] joined)
+  const rawDate = parsed.argv.slice(1).join(' ');
+  const targetDate = parseDateSpec(rawDate || undefined);
+  if (targetDate === null) {
+    await ctx.reply(`invalid date: "${rawDate}". Use: today, yesterday, Nd, or YYYY-MM-DD`);
+    return;
+  }
+
+  // Fuzzy-match the group
+  const matches = findGroupsByName(groupQuery);
+
+  if (matches.length === 0) {
+    logEvent({ kind: 'summary.no_match', query: groupQuery });
+    await ctx.reply(`no group matching "${groupQuery}"`);
+    return;
+  }
+
+  if (matches.length > 1) {
+    logEvent({ kind: 'summary.multi_match', query: groupQuery, count: matches.length });
+    const names = matches.map(m => m.name).join(', ');
+    await ctx.reply(`multiple matches: ${names}. be more specific.`);
+    return;
+  }
+
+  const match = matches[0];
+  const messages = readDayMessages(match.folder, targetDate);
+
+  if (messages.length === 0) {
+    logEvent({ kind: 'summary.empty', group: match.name, date: targetDate });
+    await ctx.reply(`no messages for ${match.name} on ${targetDate}`);
+    return;
+  }
+
+  // Format messages for the prompt
+  const messageLines = messages.map(m => {
+    const d = new Date(m.ts);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const suffix = m.from_me ? ' (me)' : '';
+    return `[${hh}:${mm}] ${m.from_name}: ${m.body}${suffix}`;
+  }).join('\n');
+
+  const prompt = fillTemplate(SUMMARY_PROMPT, {
+    GROUP_NAME: match.name,
+    DATE: targetDate,
+    MESSAGES: messageLines,
+  });
+
+  const callStart = Date.now();
+  try {
+    const result = await callClaude(prompt);
+    const duration = Date.now() - callStart;
+    const summary = result.trim();
+
+    if (!summary) {
+      await ctx.reply('summary was empty');
+      return;
+    }
+
+    logEvent({
+      kind: 'summary.generated',
+      group: match.name,
+      date: targetDate,
+      msg_count: messages.length,
+      duration_ms: duration,
+    });
+    await ctx.reply(summary);
+  } catch (e) {
+    logEvent({ kind: 'summary.error', group: match.name, reason: (e as Error).message });
+    await ctx.reply(`summary failed: ${(e as Error).message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
 
@@ -551,6 +677,9 @@ export async function dispatchCommand(
         break;
       case 'topic':
         await cmdTopic(parsed, ctx);
+        break;
+      case 'summary':
+        await cmdSummary(parsed, ctx);
         break;
       default:
         await ctx.reply(`unknown command: ${parsed.name}. try !help`);

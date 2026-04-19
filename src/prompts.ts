@@ -191,10 +191,45 @@ Do NOT include:
 
 # OUTPUT (one topic per line, max 20, lowercase)`;
 
+export const SUMMARY_PROMPT = `You will see messages from a WhatsApp group chat on a specific date. Produce a concise summary for Nick (the bot owner) who wants to catch up on what was discussed.
+
+# GROUP
+
+{GROUP_NAME}
+
+# DATE
+
+{DATE}
+
+# MESSAGES
+
+Each line is formatted as: [HH:MM] <sender>: <body>
+Messages marked (me) are from Nick himself.
+
+{MESSAGES}
+
+# OUTPUT FORMAT
+
+Output plain text for Nick to read on his phone. Keep it tight.
+
+Structure:
+1. One-line vibe check ("mostly logistics for Saturday's dinner" / "drama about X / Y exchange / slow day")
+2. Bulleted list of discrete topics/events discussed (max 8 bullets)
+3. Optional "Open threads" section listing unresolved questions or promises from today that Nick should know about
+
+If the day had very little activity, say so in one sentence and stop. No padding.
+
+Do NOT include every message verbatim. Synthesize.`;
+
 export function fillTemplate(template: string, vars: Record<string, string>): string {
   let result = template;
   for (const key of Object.keys(vars)) {
-    result = result.replace(new RegExp(`\\{${key}\\}`, 'g'), vars[key]);
+    // String.prototype.replace interprets special sequences like $&, $1, $$
+    // in the replacement string. User-supplied content (message bodies, group
+    // names) may contain literal $ characters that would silently corrupt the
+    // output. Escape every $ to $$ so replace emits them as literal $.
+    const safeValue = vars[key].replace(/\$/g, '$$$$');
+    result = result.replace(new RegExp(`\\{${key}\\}`, 'g'), safeValue);
   }
   return result;
 }

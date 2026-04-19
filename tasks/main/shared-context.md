@@ -1,68 +1,100 @@
-# Shared Context for Ambient Replies Feature
+# Shared Context for Group Message Archive + Summary Command
 
 ## What's being built
 
-Add an "ambient reply" path so the bot can chime in on plain group messages
-(no mention, no reply-to-Nick) when they're about Nick or topics he cares about.
-Togglable via `!` commands. Off by default for all groups; once enabled
-globally, applies to every group Nick is in unless a specific group is
-explicitly disabled.
+1. Persist every group message the bot sees to disk, as JSONL files
+   organized by group folder + date.
+2. New `!summary <group> [date]` command (in self-chat) that reads the
+   relevant JSONL, calls claude, and replies with a summary.
 
-## Feature decisions (from 2026-04-18)
-
-1. **Topic source**: hybrid — explicit list (managed via `!topic`) + auto-extract
-   from voice profile + aggregated `## Recurring topics` sections from all
-   `data/contacts/*.md` files.
-2. **Daily cap**: default 30 ambient replies per day, adjustable via `!ambient cap <n>`.
-3. **Per-group rate limit**: not added. Existing 10s-per-group rate limit
-   (from the mention path) still applies since it reuses `lastReplyAt`.
-4. **Opening style**: let voice profile govern. No hardcoded prefix.
-5. **Scope**: `!ambient on` enables globally. `!ambient off <chat>` disables
-   a specific group. `!ambient off` with no arg disables globally (master kill).
-6. **Topic matching**: fuzzy match with confidence threshold, not substring.
-
-## Pipeline
+## Layout
 
 ```
-message_create, plain group message (not mention, not reply-to-Nick, not fromMe):
-  └─ ambient config: masterEnabled? NO → skip
-  └─ chat.name in disabledGroups? YES → skip
-  └─ daily cap exceeded? YES → skip
-  └─ fuzzy match body against topicBank
-     (explicit + voice-profile-topics + memory-recurring-topics)
-  └─ best fuzzy score < threshold → skip
-  └─ call claude with AMBIENT-flavored RUNTIME_PROMPT
-     (strongly prefers silence; only outputs when genuinely worth chiming in)
-  └─ empty response → skip, log as "declined by model"
-  └─ non-empty → send reply, record in repliesToday, log
+data/groups/
+  .index.json           # { "<group-jid>@g.us": { "name": "mgz", "folder": "mgz" } }
+  mgz/
+    2026-04-18.jsonl
+    2026-04-19.jsonl
+  reptime-br/
+    2026-04-18.jsonl
 ```
 
-## Design note: single claude call, not separate classifier
+Each JSONL line:
+```json
+{"ts":"2026-04-18T14:32:11.000Z","local_date":"2026-04-18","from_jid":"5511...@c.us","from_name":"Alice","body":"hey","from_me":false,"type":"chat","id":"msg-id","has_quoted":false,"quoted_id":null}
+```
 
-The original sketch had 2 claude calls: classifier + reply. The shipped
-version uses ONE call with an AMBIENT-flavored prompt prefix that strongly
-biases toward silence. Claude's existing RUNTIME_PROMPT already allows
-empty output — we just make silence more likely for ambient triggers. This
-halves latency and cost vs. a separate classifier step, and leverages
-existing infrastructure.
+Local date is pre-computed so file placement is deterministic. ISO ts in
+UTC preserved for ordering.
 
-## Project state (as of 2026-04-18)
+## Folder naming rule
 
-- Build: `npm run build` → `tsc`, exits 0
-- Tests: 139 passing across 10 files
-- Source files in `src/`: claude.ts, commands.ts, events.ts, extract.ts,
-  index.ts, memory-bootstrap.ts, memory-guard.ts, memory.ts, prompts.ts,
-  setup.ts, stats.ts, whatsapp.ts (+ matching `.test.ts`)
-- Conventions: TypeScript CommonJS, Vitest, tsx, single-brace `{KEY}`
-  placeholders, atomic file writes via tmp+rename, no emojis in code.
-- `data/` is the runtime root. `data/contacts/*.md` is the per-contact memory.
-  `data/voice_profile.md` is the voice profile. Both gitignored.
+Normalize the chat name:
+- lowercase
+- strip accents using same mapping as `src/fuzzy.ts` normalize (reuse it)
+- replace any non-alphanumeric run with a single `-`
+- trim leading/trailing dashes
+- collapse multiple dashes
 
-## New files this batch introduces
+If normalized is empty (all-emoji chat name), fall back to the group's
+JID user part (digits before `@g.us`).
 
-- `src/fuzzy.ts` — Dice-coefficient bigram fuzzy match helper (pure function)
-- `src/ambient.ts` — ambient config I/O, topic bank builder, should-reply gate
-- `data/ambient-config.json` — persisted state (gitignored)
+Collisions: append `-2`, `-3`, etc. based on what's already in the
+index. Track all mappings in `data/groups/.index.json`.
 
-## Dependencies to add
-None — all helpers are written in pure TS using node built-ins.
+## Command spec
+
+```
+!summary <group> [date]
+
+group: fuzzy-match against known group names from the index.
+  Multiple matches → reply with candidates, ask for more specific.
+  Zero matches → reply "no group matching <query>".
+  One match → proceed.
+
+date:
+  today (default)
+  yesterday
+  Nd      (N days ago, e.g. 2d → day before yesterday)
+  YYYY-MM-DD
+
+Examples:
+!summary mgz
+!summary mgz yesterday
+!summary reptime 3d
+!summary "oe reborn" 2026-04-15
+```
+
+Output: multi-line reply, plain summary. No explicit voice-profile
+application — this is a meta-utility.
+
+## When to persist
+
+At the TOP of the `message_create` handler, right after `chat.isGroup`
+is confirmed true, BEFORE fromMe / mention / rate-limit gates. We want
+every chat message archived — including Nick's own — so summaries have
+complete context.
+
+Persistence failures must be non-fatal. Log a warning, continue the
+handler.
+
+## Message types to persist
+
+- `type === 'chat'` → body populated, full record
+- Other types (image, sticker, audio, ptt, etc.) → record with
+  `body: "[<type>]"` or similar, type field set correctly
+- System messages (e.g. "Alice added Bob") → skip entirely
+
+## Project state
+
+- 196 tests passing across 12 files, `tsc` clean.
+- Files in src/: ambient.ts, claude.ts, commands.ts, events.ts, extract.ts,
+  fuzzy.ts, index.ts, memory-bootstrap.ts, memory-guard.ts, memory.ts,
+  prompts.ts, setup.ts, stats.ts, whatsapp.ts (+ matching .test.ts for
+  most).
+- Conventions: TypeScript CommonJS, Vitest, tsx, atomic writes via
+  tmp+rename, single-brace `{KEY}` placeholders.
+
+## Dependencies
+
+No new npm deps. Use node built-ins only.
