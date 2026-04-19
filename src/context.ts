@@ -24,6 +24,10 @@ export interface BurstOptions {
   burstGapSec: number; // e.g. 5 * 60 — a gap this large ends the burst
   maxBefore: number;
   maxAfter: number;
+  // If set, always include at least this many of the most-recent pre-trigger
+  // messages even when they fall outside the burst gap. Prevents Claude from
+  // being starved of context when someone mentions Nick after a long silence.
+  minBefore?: number;
 }
 
 export interface BurstWindow<M extends ContextMessage = ContextMessage> {
@@ -56,6 +60,13 @@ export function selectBurstWindow<M extends ContextMessage>(
   trigger: ContextMessage,
   opts: BurstOptions,
 ): BurstWindow<M> {
+  // Defensive: if the trigger timestamp is not a finite number (rare WA
+  // quirks with forwarded/system messages), every comparison returns false
+  // and we produce empty before/after. Return early to make this explicit.
+  if (!Number.isFinite(trigger.timestamp)) {
+    return { before: [], after: [] };
+  }
+
   const sorted = sortAsc(dedupeById(pool));
   const withoutTrigger = sorted.filter(m => m.id !== trigger.id);
 
@@ -73,6 +84,23 @@ export function selectBurstWindow<M extends ContextMessage>(
     before.unshift(m);
     prevTs = m.timestamp;
     if (before.length >= opts.maxBefore) break;
+  }
+
+  // Floor: if the burst returned fewer than minBefore messages, pad with
+  // the most-recent pre-trigger messages (ignoring the burst cutoff) until
+  // we hit minBefore or run out. Never exceeds maxBefore.
+  if (opts.minBefore && before.length < opts.minBefore) {
+    const target = Math.min(opts.minBefore, opts.maxBefore, beforePool.length);
+    const existing = new Set(before.map(m => m.id));
+    for (let i = beforePool.length - 1; i >= 0 && before.length < target; i--) {
+      const m = beforePool[i];
+      if (existing.has(m.id)) continue;
+      before.unshift(m);
+      existing.add(m.id);
+    }
+    // Re-sort: floor entries were unshifted in reverse-chronological order
+    // but the walk may have interleaved them with burst entries.
+    before.sort((a, b) => a.timestamp - b.timestamp);
   }
 
   // AFTER: walk forward from the first post-trigger message.

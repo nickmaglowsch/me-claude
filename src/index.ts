@@ -37,6 +37,9 @@ const AFTER_WAIT_MS = 8_000;   // wait before replying (to collect after-message
 const BURST_GAP_SEC = 5 * 60;   // 5 minutes — typical pause between threads
 const MAX_BEFORE = 15;          // ceiling even if burst is longer
 const MAX_AFTER = 10;
+const MIN_BEFORE = 3;           // floor — even in a quiet chat, give Claude
+                                // the 3 most recent pre-trigger messages so
+                                // it isn't replying blind after a long silence
 const FETCH_POOL_LIMIT = 40;    // how many raw messages to fetch per side
 
 // Silence map: chat-name → muted-until-ms; "*" key for global mute.
@@ -200,6 +203,11 @@ async function main(): Promise<void> {
         return;
       }
 
+      // Archive folder for this group. Computed once per handler invocation
+      // and reused by both the persist block and the prompt vars below.
+      // ensureGroupFolder is a no-op disk read after the group is registered.
+      const groupFolder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
+
       // Archive every group message for summary/search. Errors are swallowed
       // inside persistMessage; no gating here.
       // Skip system messages that have no conversational content.
@@ -214,7 +222,6 @@ async function main(): Promise<void> {
       ]);
       if (!SYSTEM_TYPES.has(msg.type)) {
         try {
-          const folder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
           const contact = msg.fromMe
             ? undefined
             : await msg.getContact().catch(() => undefined);
@@ -242,7 +249,7 @@ async function main(): Promise<void> {
             },
           });
           logEvent({ kind: 'group.persisted', chat_id: chat.id._serialized, chat: chat.name, msg_type: msg.type });
-          dbg(`persisted to ${folder}/${localDate(tsMs)}`);
+          dbg(`persisted to ${groupFolder}/${localDate(tsMs)}`);
         } catch (e) {
           dbg(`persist error: ${(e as Error).message}`);
         }
@@ -258,17 +265,24 @@ async function main(): Promise<void> {
       // Log every group message received with mention info so we can see the raw shape
       dbg(`msg in [${chat.name}]: body="${(msg.body || '').slice(0, 60)}" mentionedIds=${JSON.stringify(msg.mentionedIds)} hasQuoted=${msg.hasQuotedMsg}`);
 
+      // Resolve the quoted message ONCE — both trigger detection and the
+      // anchor-block builder below need it, and every call is a round-trip
+      // through whatsapp-web.js/puppeteer.
+      let quotedMsg: any = null;
+      if (msg.hasQuotedMsg) {
+        try {
+          quotedMsg = await msg.getQuotedMessage();
+        } catch (e) {
+          dbg(`getQuotedMessage failed: ${(e as Error).message}`);
+        }
+      }
+
       // Gate 3: we must be mentioned OR they must be replying to one of our messages
       let trigger: 'mention' | 'reply' | 'ambient' | null = null;
       if (isMentioned(msg.mentionedIds, ownerIds)) {
         trigger = 'mention';
-      } else if (msg.hasQuotedMsg) {
-        try {
-          const quoted = await msg.getQuotedMessage();
-          if (quoted?.fromMe) trigger = 'reply';
-        } catch (e) {
-          dbg(`getQuotedMessage failed: ${(e as Error).message}`);
-        }
+      } else if (quotedMsg?.fromMe) {
+        trigger = 'reply';
       }
       // Silence check: global mute ("*") or per-chat mute.
       // Runs BEFORE the ambient gate so silenced chats never reach topic-bank
@@ -365,26 +379,24 @@ async function main(): Promise<void> {
         burstGapSec: BURST_GAP_SEC,
         maxBefore: MAX_BEFORE,
         maxAfter: MAX_AFTER,
+        minBefore: MIN_BEFORE,
       });
 
       // If the mention is a reply to an older message that fell outside the
-      // burst window, surface it as a separate QUOTED block. Skip silently
-      // on any whatsapp-web.js error — the reply still works without it.
+      // burst window, surface it as a separate QUOTED block. Reuses the
+      // quotedMsg resolved above so we don't round-trip to puppeteer twice.
+      //
+      // Self-quote guard: if WA returns the trigger itself as its own quoted
+      // message (edge case we've seen with forwarded/edited messages), skip —
+      // duplicating MENTION into QUOTED would be worse than dropping it.
       let quotedAnchorRaw: any = null;
-      if (msg.hasQuotedMsg) {
-        try {
-          const q = await msg.getQuotedMessage();
-          if (q) {
-            const windowIds = new Set<string>([
-              ...before.map(m => m.id),
-              ...after.map(m => m.id),
-            ]);
-            const anchor = extractQuotedAnchor(toCtxMsg(q), { windowIds });
-            if (anchor) quotedAnchorRaw = (anchor as any)._raw;
-          }
-        } catch (e) {
-          dbg(`quoted anchor fetch failed: ${(e as Error).message}`);
-        }
+      if (quotedMsg && quotedMsg.id?._serialized !== msg.id?._serialized) {
+        const windowIds = new Set<string>([
+          ...before.map(m => m.id),
+          ...after.map(m => m.id),
+        ]);
+        const anchor = extractQuotedAnchor(toCtxMsg(quotedMsg), { windowIds });
+        if (anchor) quotedAnchorRaw = (anchor as any)._raw;
       }
 
       // Helper: format a message line (requires resolving sender name)
@@ -414,10 +426,6 @@ async function main(): Promise<void> {
       );
       const mentionLine = formatMessageLine(msg, mentionSenderName);
       const quotedLine = quotedAnchorRaw ? await formatLine(quotedAnchorRaw) : null;
-
-      // Look up the archive folder for this group so Claude can grep it if
-      // the conversation references something older than the burst window.
-      const groupFolder = ensureGroupFolder(chat.id._serialized, chat.name ?? '');
 
       logEvent({
         kind: 'context.window',

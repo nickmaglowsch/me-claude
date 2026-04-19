@@ -116,7 +116,7 @@ Keep each file under ~4000 characters. If the file is getting long, consolidate 
 
 # CONTEXT FORMAT
 
-You will receive a BEFORE block and an AFTER block around the mention, selected by burst — i.e. contiguous messages with no gap larger than ~5 minutes — rather than a fixed message count. A quiet group may give you only 2-3 messages; an active burst may give you more. Messages are formatted as:
+You will receive a BEFORE block and an AFTER block around the mention, selected by burst — i.e. contiguous messages with no gap larger than ~5 minutes — rather than a fixed message count. A quiet group gives you at least the 3 most recent pre-trigger messages (even if they're hours old); an active burst gives you more, up to a cap. Messages are formatted as:
 
 [HH:MM] SenderName: message text
 
