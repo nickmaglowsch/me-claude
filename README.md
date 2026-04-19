@@ -64,13 +64,13 @@ Memory files are read and updated directly by Claude via filesystem tools (Read/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OWNER_ID` | Auto-detected | Your @c.us JID (e.g. `15551234567@c.us`). Override if auto-detection is wrong. Logged at startup. |
-| `OWNER_LID` | (unset) | Your @lid JID (e.g. `261460529811482@lid`). WhatsApp uses this in group mentions — set it in `.env` if the bot doesn't react to @-tags in groups. |
+| `OWNER_LID` | (unset) | Your @lid JID (e.g. `100000000000000@lid`). WhatsApp uses this in group mentions — set it in `.env` if the bot doesn't react to @-tags in groups. |
 | `BOT_DEBUG` | `0` | Set to `1` for verbose per-message logging (useful for diagnosing dropped mentions). |
 
 Example `.env`:
 
 ```bash
-OWNER_LID=261460529811482@lid
+OWNER_LID=100000000000000@lid
 ```
 
 ## Architecture

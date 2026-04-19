@@ -34,12 +34,12 @@ afterEach(() => {
 describe('isCusJid / isLidJid', () => {
   it('identifies @c.us JIDs', () => {
     expect(isCusJid('5511987654321@c.us')).toBe(true);
-    expect(isCusJid('261460529811482@lid')).toBe(false);
+    expect(isCusJid('100000000000000@lid')).toBe(false);
     expect(isCusJid('5511987654321')).toBe(false);
   });
 
   it('identifies @lid JIDs', () => {
-    expect(isLidJid('261460529811482@lid')).toBe(true);
+    expect(isLidJid('100000000000000@lid')).toBe(true);
     expect(isLidJid('5511987654321@c.us')).toBe(false);
     expect(isLidJid('')).toBe(false);
   });
@@ -115,7 +115,7 @@ describe('resolveToCus', () => {
   });
 
   it('returns null for @lid when no chat is provided', () => {
-    expect(resolveToCus('261460529811482@lid')).toBeNull();
+    expect(resolveToCus('100000000000000@lid')).toBeNull();
   });
 
   it('resolves @lid via participants list when chat is provided', () => {
@@ -123,7 +123,7 @@ describe('resolveToCus', () => {
       participants: [
         {
           id: { _serialized: '5511987654321@c.us' },
-          lid: { _serialized: '261460529811482@lid' },
+          lid: { _serialized: '100000000000000@lid' },
         },
         {
           id: { _serialized: '5521999999999@c.us' },
@@ -131,7 +131,7 @@ describe('resolveToCus', () => {
         },
       ],
     };
-    expect(resolveToCus('261460529811482@lid', chat)).toBe('5511987654321@c.us');
+    expect(resolveToCus('100000000000000@lid', chat)).toBe('5511987654321@c.us');
     expect(resolveToCus('111111111111111@lid', chat)).toBe('5521999999999@c.us');
   });
 
@@ -140,14 +140,14 @@ describe('resolveToCus', () => {
       participants: [
         {
           id: { _serialized: '5511987654321@c.us' },
-          lid: { _serialized: '261460529811482@lid' },
+          lid: { _serialized: '100000000000000@lid' },
         },
       ],
     };
     // First call: resolved from participants
-    expect(resolveToCus('261460529811482@lid', chat)).toBe('5511987654321@c.us');
+    expect(resolveToCus('100000000000000@lid', chat)).toBe('5511987654321@c.us');
     // Second call without chat: still resolved, from cache
-    expect(resolveToCus('261460529811482@lid')).toBe('5511987654321@c.us');
+    expect(resolveToCus('100000000000000@lid')).toBe('5511987654321@c.us');
   });
 
   it('returns null when @lid is not in the participants list', () => {
@@ -155,7 +155,7 @@ describe('resolveToCus', () => {
       participants: [
         {
           id: { _serialized: '5511987654321@c.us' },
-          lid: { _serialized: '261460529811482@lid' },
+          lid: { _serialized: '100000000000000@lid' },
         },
       ],
     };
@@ -167,11 +167,11 @@ describe('resolveToCus', () => {
       participants: [
         {
           id: { _serialized: '5511987654321@c.us' },
-          lid: '261460529811482@lid',
+          lid: '100000000000000@lid',
         },
       ],
     };
-    expect(resolveToCus('261460529811482@lid', chat)).toBe('5511987654321@c.us');
+    expect(resolveToCus('100000000000000@lid', chat)).toBe('5511987654321@c.us');
   });
 });
 

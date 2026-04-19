@@ -72,7 +72,7 @@ mentions map back to the right file.
 ## Identity
 - Phone: +55 11 98765-4321
 - @c.us: 5511987654321@c.us
-- @lid aliases: [261460529811482@lid, ...]
+- @lid aliases: [100000000000000@lid, ...]
 - First seen: YYYY-MM-DD
 - Last updated: YYYY-MM-DD
 

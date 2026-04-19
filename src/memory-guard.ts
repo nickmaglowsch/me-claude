@@ -63,6 +63,25 @@ function buildCommitSubject(
 // prevents shell injection, but this keeps commit messages well-formed.
 const safe = (s: string): string => s.replace(/[\n\r`$"]/g, ' ');
 
+// Initialize the nested git repo at data/contacts/ if it doesn't exist yet.
+// This repo is private (kept under a gitignored dir) so memory file history
+// never lands in the main project repo — which matters if the main project
+// is ever pushed publicly. Git identity is set locally (never global) so
+// the user's machine-wide config isn't touched.
+function ensureContactsRepo(contactsDir: string): void {
+  if (fs.existsSync(path.join(contactsDir, '.git'))) return;
+  fs.mkdirSync(contactsDir, { recursive: true });
+  execFileSync('git', ['init'], { cwd: contactsDir, stdio: 'pipe' });
+  // Best-effort local identity — falls back to any inherited defaults if
+  // these fail. Never throws.
+  try {
+    execFileSync('git', ['config', 'user.email', 'memory-guard@localhost'], { cwd: contactsDir, stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.name', 'memory-guard'], { cwd: contactsDir, stdio: 'pipe' });
+  } catch {
+    /* inherited config is fine */
+  }
+}
+
 function gitCommit(
   cusJid: string,
   isNew: boolean,
@@ -70,7 +89,9 @@ function gitCommit(
   newHash: string,
   context?: { reason?: string; chatName?: string },
 ): void {
-  const filePath = path.join('data', 'contacts', `${cusJid}.md`);
+  const contactsDir = getContactsDir();
+  // The file path relative to the nested repo root is just "<jid>.md".
+  const filePath = `${cusJid}.md`;
   const subject = safe(buildCommitSubject(cusJid, isNew, context?.chatName));
   const body = safe([
     `Reason: ${context?.reason ?? 'update'}`,
@@ -78,12 +99,12 @@ function gitCommit(
     `New hash: ${newHash}`,
   ].join('\n'));
 
-  const cwd = process.cwd();
-
-  // Force-add bypasses .gitignore so these privacy-sensitive files stay
-  // local-only (not in fresh clones) but are versioned for revert safety.
-  // Args passed as array to execFileSync — no shell involved, no injection risk.
-  execFileSync('git', ['add', '-f', filePath], { cwd, encoding: 'utf8', stdio: 'pipe' });
+  // Run git commands INSIDE the nested repo at data/contacts/. That repo
+  // is separate from the main project repo — memory history never leaks
+  // into main's history. Args passed as argv array (no shell).
+  ensureContactsRepo(contactsDir);
+  const cwd = contactsDir;
+  execFileSync('git', ['add', filePath], { cwd, encoding: 'utf8', stdio: 'pipe' });
   execFileSync('git', ['commit', '-m', subject, '-m', body], { cwd, encoding: 'utf8', stdio: 'pipe' });
 }
 

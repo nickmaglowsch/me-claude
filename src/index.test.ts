@@ -15,20 +15,20 @@ describe('isMentioned', () => {
   });
 
   it('matches @c.us prefix against bare digit form (same prefix)', () => {
-    expect(isMentioned(['5513974190999@c.us'], ['5513974190999'])).toBe(true);
+    expect(isMentioned(['15551234567@c.us'], ['15551234567'])).toBe(true);
   });
 
   it('matches @lid when owner list includes the @lid id', () => {
     // @lid and @c.us are unrelated IDs for the same user; we match each independently.
-    expect(isMentioned(['261460529811482@lid'], ['5513974190999@c.us', '261460529811482@lid'])).toBe(true);
+    expect(isMentioned(['100000000000000@lid'], ['15551234567@c.us', '100000000000000@lid'])).toBe(true);
   });
 
   it('does NOT match @lid against a different @c.us id', () => {
-    expect(isMentioned(['261460529811482@lid'], ['5513974190999@c.us'])).toBe(false);
+    expect(isMentioned(['100000000000000@lid'], ['15551234567@c.us'])).toBe(false);
   });
 
   it('accepts object-shaped mentionedIds with _serialized', () => {
-    expect(isMentioned([{ _serialized: '5513974190999@c.us' }], ['5513974190999@c.us'])).toBe(true);
+    expect(isMentioned([{ _serialized: '15551234567@c.us' }], ['15551234567@c.us'])).toBe(true);
   });
 
   it('returns false when mentionedIds is not an array', () => {
