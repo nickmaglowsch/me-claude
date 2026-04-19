@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -83,6 +83,50 @@ describe('saveAmbientConfig atomic write', () => {
     const dataDir = path.join(tmpDir, 'data');
     const leftovers = fs.readdirSync(dataDir).filter(f => f.includes('.tmp-'));
     expect(leftovers).toEqual([]);
+  });
+
+  // --- safety-net: correct final content when overwriting --------------------
+  // Protects task-05 (random tmp naming + O_EXCL) from regressing the overwrite
+  // semantics.
+  it('second save overwrites first: loadAmbientConfig returns the second config', () => {
+    const first: AmbientConfig = {
+      ...defaultAmbientConfig(),
+      dailyCap: 10,
+      explicitTopics: ['tennis'],
+    };
+    const second: AmbientConfig = {
+      ...defaultAmbientConfig(),
+      dailyCap: 99,
+      explicitTopics: ['crypto', 'startups'],
+    };
+
+    saveAmbientConfig(first);
+    saveAmbientConfig(second);
+
+    const loaded = loadAmbientConfig();
+    expect(loaded.dailyCap).toBe(99);
+    expect(loaded.explicitTopics).toEqual(['crypto', 'startups']);
+    // First config must be fully replaced
+    expect(loaded.explicitTopics).not.toContain('tennis');
+    expect(loaded.dailyCap).not.toBe(10);
+  });
+
+  it('saveAmbientConfig writes valid JSON that can be parsed independently', () => {
+    const cfg: AmbientConfig = {
+      ...defaultAmbientConfig(),
+      masterEnabled: true,
+      dailyCap: 42,
+      explicitTopics: ['one', 'two'],
+    };
+    saveAmbientConfig(cfg);
+
+    const cfgPath = path.join(tmpDir, 'data', 'ambient-config.json');
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    expect(() => JSON.parse(raw)).not.toThrow();
+    const parsed = JSON.parse(raw);
+    expect(parsed.masterEnabled).toBe(true);
+    expect(parsed.dailyCap).toBe(42);
+    expect(parsed.explicitTopics).toEqual(['one', 'two']);
   });
 });
 
@@ -357,5 +401,160 @@ describe('extractVoiceProfileTopics', () => {
     fs.writeFileSync(vpPath, 'fake voice profile', 'utf8');
     const topics = await extractVoiceProfileTopics(vpPath);
     expect(topics).toEqual([]);
+  });
+});
+
+// ---- loadAmbientConfig schema validation ------------------------------------
+
+describe('loadAmbientConfig schema validation', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ambient-schema-test-'));
+    fs.mkdirSync(path.join(tmpDir, 'data'), { recursive: true });
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeConfig(obj: unknown): void {
+    fs.writeFileSync(
+      path.join(tmpDir, 'data', 'ambient-config.json'),
+      JSON.stringify(obj),
+      'utf8',
+    );
+  }
+
+  it('valid config loads correctly', () => {
+    writeConfig({
+      masterEnabled: true,
+      disabledGroups: ['chat-a'],
+      explicitTopics: ['football'],
+      dailyCap: 20,
+      confidenceThreshold: 0.6,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.masterEnabled).toBe(true);
+    expect(cfg.explicitTopics).toEqual(['football']);
+  });
+
+  it('missing masterEnabled field → returns defaultAmbientConfig', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeConfig({ disabledGroups: [], explicitTopics: [] }); // masterEnabled missing
+    const cfg = loadAmbientConfig();
+    expect(cfg).toEqual(defaultAmbientConfig());
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('masterEnabled is string instead of boolean → returns defaultAmbientConfig', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeConfig({
+      masterEnabled: 'yes',  // wrong type
+      disabledGroups: [],
+      explicitTopics: [],
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg).toEqual(defaultAmbientConfig());
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics is not an array → returns defaultAmbientConfig', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: 'football',  // should be array
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg).toEqual(defaultAmbientConfig());
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics longer than 200 entries → truncated to 200 with warning', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const bigBank = Array.from({ length: 205 }, (_, i) => `topic-${i}`);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: bigBank,
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toHaveLength(200);
+    expect(cfg.explicitTopics[0]).toBe('topic-0');
+    expect(cfg.explicitTopics[199]).toBe('topic-199');
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics entry longer than 64 chars → dropped at load time', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const longPhrase = 'x'.repeat(65);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: ['ok', longPhrase, 'also-ok'],
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toEqual(['ok', 'also-ok']);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics at the caps (200 entries, 64 chars each) passes through untouched', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const maxPhrase = 'y'.repeat(64);
+    const bank = Array.from({ length: 200 }, () => maxPhrase);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: bank,
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toHaveLength(200);
+    expect(cfg.explicitTopics.every(t => t === maxPhrase)).toBe(true);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

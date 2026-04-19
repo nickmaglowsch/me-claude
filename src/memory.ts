@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { atomicWriteFile } from './atomic';
 
 // Per-contact memory files live here. Filename format is "<c.us jid>.md"
 // (e.g. "5511987654321@c.us.md"), matching the PRD convention. Files are
@@ -40,9 +41,7 @@ export function readContactMemory(cusJid: string): string | null {
 export function writeContactMemory(cusJid: string, contents: string): void {
   fs.mkdirSync(CONTACTS_DIR, { recursive: true });
   const finalPath = contactFilePath(cusJid);
-  const tmpPath = `${finalPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, contents, 'utf8');
-  fs.renameSync(tmpPath, finalPath);
+  atomicWriteFile(finalPath, contents);
 }
 
 // Guarded write with corruption detection and auto git commit.

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { atomicWriteFile } from './atomic';
 import { bestFuzzyMatch } from './fuzzy';
 import { callClaude } from './claude';
 import { VOICE_PROFILE_TOPIC_EXTRACTION_PROMPT, fillTemplate } from './prompts';
@@ -37,15 +38,55 @@ function resolvedConfigPath(): string {
   return path.join(process.cwd(), AMBIENT_CONFIG_PATH);
 }
 
+// Caps mirror the add-time limits in cmdTopic (src/commands.ts) so a hand-edited
+// config cannot bypass them. Values over the caps are truncated at load time with
+// a warning; the config itself remains valid.
+const MAX_TOPIC_LENGTH = 64;
+const MAX_TOPIC_BANK = 200;
+
+function isValidAmbientConfig(obj: unknown): obj is AmbientConfig {
+  if (typeof obj !== 'object' || obj === null) return false;
+  const c = obj as Record<string, unknown>;
+  return (
+    typeof c.masterEnabled === 'boolean' &&
+    Array.isArray(c.disabledGroups) &&
+    Array.isArray(c.explicitTopics) &&
+    typeof c.dailyCap === 'number' &&
+    typeof c.confidenceThreshold === 'number' &&
+    Array.isArray(c.voiceProfileTopics) &&
+    typeof c.voiceProfileMtime === 'number' &&
+    Array.isArray(c.repliesToday) &&
+    typeof c.lastReset === 'string'
+  );
+}
+
+function clampExplicitTopics(cfg: AmbientConfig): AmbientConfig {
+  const kept = cfg.explicitTopics
+    .filter((t): t is string => typeof t === 'string' && t.length <= MAX_TOPIC_LENGTH)
+    .slice(0, MAX_TOPIC_BANK);
+  if (kept.length !== cfg.explicitTopics.length) {
+    console.warn(
+      `[ambient] explicitTopics truncated to ${kept.length}/${cfg.explicitTopics.length} ` +
+      `(cap: ${MAX_TOPIC_BANK} entries, ${MAX_TOPIC_LENGTH} chars each)`
+    );
+    return { ...cfg, explicitTopics: kept };
+  }
+  return cfg;
+}
+
 export function loadAmbientConfig(): AmbientConfig {
   const cfgPath = resolvedConfigPath();
   try {
     const raw = fs.readFileSync(cfgPath, 'utf8');
-    return JSON.parse(raw) as AmbientConfig;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isValidAmbientConfig(parsed)) {
+      console.warn('[ambient] ambient-config.json failed schema validation, using defaults');
+      return defaultAmbientConfig();
+    }
+    return clampExplicitTopics(parsed);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      // Malformed JSON or other read error — log and return defaults.
       console.warn('[ambient] failed to parse ambient config, using defaults:', (err as Error).message);
     }
     return defaultAmbientConfig();
@@ -55,9 +96,7 @@ export function loadAmbientConfig(): AmbientConfig {
 export function saveAmbientConfig(cfg: AmbientConfig): void {
   const cfgPath = resolvedConfigPath();
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
-  const tmpPath = `${cfgPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2), 'utf8');
-  fs.renameSync(tmpPath, cfgPath);
+  atomicWriteFile(cfgPath, JSON.stringify(cfg, null, 2));
 }
 
 // Returns today's date as "YYYY-MM-DD".

@@ -90,4 +90,72 @@ describe('fillTemplate', () => {
     });
     expect(result).not.toMatch(/\{[A-Z_]+\}/);
   });
+
+  // --- safety-net: $ escape ---------------------------------------------------
+  // These lock in the current $ escaping behavior so the task-03 refactor
+  // (RegExp → split/join) can be validated against them.
+
+  it('value containing $1 appears literally in output — not as regex back-reference', () => {
+    expect(fillTemplate('{BODY}', { BODY: 'a$1b' })).toBe('a$1b');
+  });
+
+  it('value containing $$ appears as two literal dollar signs', () => {
+    expect(fillTemplate('{BODY}', { BODY: '$$' })).toBe('$$');
+  });
+
+  it('value with mixed back-reference-like sequences appears literally', () => {
+    expect(fillTemplate('result: {V}', { V: '$` $\' $0 $1 $&' })).toBe("result: $` $' $0 $1 $&");
+  });
+
+  // --- safety-net: empty value ------------------------------------------------
+  it('empty string value replaces placeholder with empty string', () => {
+    expect(fillTemplate('hello {NAME} world', { NAME: '' })).toBe('hello  world');
+  });
+
+  // --- safety-net: repeated placeholder with $ value -------------------------
+  it('repeated placeholder with $ value: all occurrences replaced with literal $', () => {
+    expect(fillTemplate('{X} and {X}', { X: '$1' })).toBe('$1 and $1');
+  });
+
+  // --- safety-net: key with no matching placeholder is silently ignored -------
+  it('extra key in vars with no corresponding placeholder is ignored', () => {
+    expect(fillTemplate('hello', { UNUSED: 'something' })).toBe('hello');
+  });
+
+  // --- safety-net: regex metacharacters in key --------------------------------
+  it('key containing regex metacharacters does not throw and substitutes correctly', () => {
+    // This would have caused a SyntaxError with the old new RegExp approach
+    // because { and } are regex quantifier syntax.
+    // (Currently all keys are safe strings, but this guards future callers.)
+    const weirdKey = 'A.B[C](D)*';
+    const template = `{${weirdKey}}`;
+    // split/join approach: the literal string {A.B[C](D)*} must be replaced
+    expect(fillTemplate(template, { [weirdKey]: 'VALUE' })).toBe('VALUE');
+  });
+
+  it('key with backslash does not corrupt output', () => {
+    const key = 'KEY\\SLASH';
+    expect(fillTemplate(`{${key}}`, { [key]: 'result' })).toBe('result');
+  });
+});
+
+describe('RUNTIME_PROMPT delimiters', () => {
+  it('RUNTIME_PROMPT contains XML delimiters around all user-controlled blocks', () => {
+    expect(RUNTIME_PROMPT).toContain('<sender_name>');
+    expect(RUNTIME_PROMPT).toContain('</sender_name>');
+    expect(RUNTIME_PROMPT).toContain('<before_messages>');
+    expect(RUNTIME_PROMPT).toContain('</before_messages>');
+    expect(RUNTIME_PROMPT).toContain('<after_messages>');
+    expect(RUNTIME_PROMPT).toContain('</after_messages>');
+    expect(RUNTIME_PROMPT).toContain('<mention_message>');
+    expect(RUNTIME_PROMPT).toContain('</mention_message>');
+  });
+
+  it('new-contact memory template uses a plain H1, not an XML-wrapped name', () => {
+    // Pushname is already sanitized (src/sandbox.ts sanitizePushname), so the H1
+    // does not need a delimiter; wrapping would leak literal tags into the
+    // persisted memory file when Claude copies the template.
+    expect(RUNTIME_PROMPT).toContain('# {SENDER_NAME}');
+    expect(RUNTIME_PROMPT).not.toContain('# <sender_name>');
+  });
 });

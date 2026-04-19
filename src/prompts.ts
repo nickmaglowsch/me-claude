@@ -71,7 +71,7 @@ You have Read, Edit, Write, Grep, and Glob tools available in the current workin
     data/contacts/<jid>@c.us.md
 
 The person who just mentioned Nick has this ID: {SENDER_JID}
-Their display name is: {SENDER_NAME}
+Their display name is: <sender_name>{SENDER_NAME}</sender_name>
 Today's date is: {TODAY}
 
 BEFORE you write the reply:
@@ -162,13 +162,19 @@ After all tool use completes, your final assistant message must be ONLY the mess
 # CHAT CONTEXT
 
 {QUOTED_BLOCK}BEFORE:
+<before_messages>
 {BEFORE_MESSAGES}
+</before_messages>
 
 MENTION:
+<mention_message>
 {MENTION_MESSAGE}
+</mention_message>
 
 AFTER:
-{AFTER_MESSAGES}`;
+<after_messages>
+{AFTER_MESSAGES}
+</after_messages>`;
 
 export const AMBIENT_PROMPT_PREFIX = `IMPORTANT: This is an AMBIENT trigger. No one @-mentioned Nick and no one replied to him. You're joining the conversation unprompted because the topic seemed relevant.
 
@@ -234,12 +240,15 @@ Do NOT include every message verbatim. Synthesize.`;
 export function fillTemplate(template: string, vars: Record<string, string>): string {
   let result = template;
   for (const key of Object.keys(vars)) {
-    // String.prototype.replace interprets special sequences like $&, $1, $$
-    // in the replacement string. User-supplied content (message bodies, group
-    // names) may contain literal $ characters that would silently corrupt the
-    // output. Escape every $ to $$ so replace emits them as literal $.
-    const safeValue = vars[key].replace(/\$/g, '$$$$');
-    result = result.replace(new RegExp(`\\{${key}\\}`, 'g'), safeValue);
+    // Use split/join instead of RegExp so key characters that are regex
+    // metacharacters (., *, +, ?, [, {, (, \, etc.) cannot cause a RegExp
+    // SyntaxError or produce wrong matches. Behavior is identical for all
+    // currently-used keys (which are safe uppercase_underscore strings).
+    //
+    // Note: split/join does NOT need the $-escaping workaround that was
+    // required by String.prototype.replace, because split/join uses the
+    // replacement value literally.
+    result = result.split(`{${key}}`).join(vars[key]);
   }
   return result;
 }

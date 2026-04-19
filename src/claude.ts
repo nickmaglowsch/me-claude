@@ -66,14 +66,21 @@ export async function callClaude(prompt: string): Promise<string> {
 }
 
 // Prompt → response with tool access enabled. Claude may Read, Edit, Write,
-// Grep, and Glob files within `cwd` (and any --add-dir paths, but we don't
-// add any). Permissions are bypassed so the subprocess runs non-interactively.
+// Grep, and Glob files within `cwd` plus any directories passed via `addDirs`.
+// Permissions are bypassed so the subprocess runs non-interactively.
 //
-// Used by the runtime to let Claude fetch + update per-contact memory files
-// on its own rather than pre-loading / post-writing them from our code.
+// SECURITY BOUNDARY (V-001):
+// The subprocess is NOT sandboxed at the OS level. The containment relies on
+// the Claude CLI honoring `cwd` for tool path resolution and on the sandbox
+// directory (created by src/sandbox.ts) containing only symlinks to the
+// files Claude legitimately needs. `--add-dir` is passed as defense-in-depth
+// so if `bypassPermissions` is ever tightened, the explicit allow-list
+// already reflects the intended scope. Callers MUST pass a dedicated sandbox
+// `cwd`; the default (process.cwd()) is used only by tests.
 export async function callClaudeWithTools(
   prompt: string,
   cwd: string = process.cwd(),
+  addDirs: string[] = [],
 ): Promise<string> {
   const toolArgs = [
     '--allowed-tools',
@@ -83,5 +90,8 @@ export async function callClaudeWithTools(
     '--output-format',
     'text',
   ];
+  for (const dir of addDirs) {
+    toolArgs.push('--add-dir', dir);
+  }
   return runClaude(prompt, toolArgs, _config.toolTimeoutMs, cwd, 'with-tools');
 }
