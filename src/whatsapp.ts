@@ -78,3 +78,21 @@ export function getOwnerName(client: Client): string {
 export function getOwnerId(client: Client): string {
   return client.info.wid._serialized;
 }
+
+// Resolve a display name for a message sender without throwing.
+// whatsapp-web.js's getContact() can blow up with
+// "getAlternateUserWid - Invalid get call using deviceWid" for certain @lid
+// senders; when that happens we fall back to the digits from author/from so
+// a single bad contact doesn't abort the surrounding Promise.all batch.
+export async function resolveSenderName(msg: any): Promise<string> {
+  try {
+    const contact = await msg.getContact();
+    const name = contact?.pushname || contact?.number;
+    if (name) return name;
+  } catch {
+    // fall through to id-based fallback
+  }
+  const rawId = msg?.author ?? msg?.from ?? '';
+  const prefix = String(rawId).split('@')[0];
+  return prefix || 'Unknown';
+}

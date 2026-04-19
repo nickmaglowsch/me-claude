@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatMessageLine, formatRawMessage, getOwnerName, getOwnerId } from './whatsapp';
+import { formatMessageLine, formatRawMessage, getOwnerName, getOwnerId, resolveSenderName } from './whatsapp';
 
 describe('formatMessageLine', () => {
   it('produces [HH:MM] SenderName: body with correct format', () => {
@@ -91,5 +91,62 @@ describe('getOwnerId', () => {
   it('returns wid._serialized from client info', () => {
     const client = { info: { wid: { _serialized: '15551234567@c.us' } } } as any;
     expect(getOwnerId(client)).toBe('15551234567@c.us');
+  });
+});
+
+describe('resolveSenderName', () => {
+  it('returns pushname when getContact resolves with one', async () => {
+    const msg = {
+      getContact: async () => ({ pushname: 'Alice', number: '15551234567' }),
+    } as any;
+    expect(await resolveSenderName(msg)).toBe('Alice');
+  });
+
+  it('falls back to contact.number when pushname is empty', async () => {
+    const msg = {
+      getContact: async () => ({ pushname: '', number: '15551234567' }),
+    } as any;
+    expect(await resolveSenderName(msg)).toBe('15551234567');
+  });
+
+  it('falls back to msg.author prefix when getContact rejects', async () => {
+    // Simulates the upstream whatsapp-web.js failure mode for @lid senders:
+    //   "getAlternateUserWid - Invalid get call using deviceWid"
+    const msg = {
+      author: '102404972409037@lid',
+      from: 'group-id@g.us',
+      getContact: async () => {
+        throw new Error('getAlternateUserWid - Invalid get call using deviceWid');
+      },
+    } as any;
+    expect(await resolveSenderName(msg)).toBe('102404972409037');
+  });
+
+  it('falls back to msg.from prefix when author is missing and getContact rejects', async () => {
+    const msg = {
+      from: '15551234567@c.us',
+      getContact: async () => {
+        throw new Error('boom');
+      },
+    } as any;
+    expect(await resolveSenderName(msg)).toBe('15551234567');
+  });
+
+  it('returns "Unknown" when getContact rejects and author/from are missing', async () => {
+    const msg = {
+      getContact: async () => {
+        throw new Error('boom');
+      },
+    } as any;
+    expect(await resolveSenderName(msg)).toBe('Unknown');
+  });
+
+  it('does not throw — always resolves to some string', async () => {
+    const msg = {
+      getContact: async () => {
+        throw new Error('boom');
+      },
+    } as any;
+    await expect(resolveSenderName(msg)).resolves.toEqual(expect.any(String));
   });
 });

@@ -7,6 +7,7 @@ import {
   getOwnerName,
   getOwnerId,
   formatMessageLine,
+  resolveSenderName,
 } from './whatsapp';
 import { callClaudeWithTools } from './claude';
 import { RUNTIME_PROMPT, AMBIENT_PROMPT_PREFIX, fillTemplate } from './prompts';
@@ -410,10 +411,11 @@ async function main(): Promise<void> {
         if (anchor) quotedAnchorRaw = (anchor as any)._raw;
       }
 
-      // Helper: format a message line (requires resolving sender name)
+      // Helper: format a message line. Sender resolution is fault-tolerant
+      // so one @lid contact that trips whatsapp-web.js's getAlternateUserWid
+      // bug doesn't reject the whole Promise.all window below.
       const formatLine = async (m: any): Promise<string> => {
-        const contact = await m.getContact();
-        const senderName = contact.pushname || contact.number || 'Unknown';
+        const senderName = await resolveSenderName(m);
         return formatMessageLine(m, senderName);
       };
 
