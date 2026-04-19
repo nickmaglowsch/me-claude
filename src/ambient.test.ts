@@ -493,4 +493,68 @@ describe('loadAmbientConfig schema validation', () => {
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
+
+  it('explicitTopics longer than 200 entries → truncated to 200 with warning', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const bigBank = Array.from({ length: 205 }, (_, i) => `topic-${i}`);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: bigBank,
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toHaveLength(200);
+    expect(cfg.explicitTopics[0]).toBe('topic-0');
+    expect(cfg.explicitTopics[199]).toBe('topic-199');
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics entry longer than 64 chars → dropped at load time', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const longPhrase = 'x'.repeat(65);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: ['ok', longPhrase, 'also-ok'],
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toEqual(['ok', 'also-ok']);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('explicitTopics at the caps (200 entries, 64 chars each) passes through untouched', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const maxPhrase = 'y'.repeat(64);
+    const bank = Array.from({ length: 200 }, () => maxPhrase);
+    writeConfig({
+      masterEnabled: false,
+      disabledGroups: [],
+      explicitTopics: bank,
+      dailyCap: 30,
+      confidenceThreshold: 0.5,
+      voiceProfileTopics: [],
+      voiceProfileMtime: 0,
+      repliesToday: [],
+      lastReset: '2026-04-19',
+    });
+    const cfg = loadAmbientConfig();
+    expect(cfg.explicitTopics).toHaveLength(200);
+    expect(cfg.explicitTopics.every(t => t === maxPhrase)).toBe(true);
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
 });

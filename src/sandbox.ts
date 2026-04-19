@@ -69,11 +69,13 @@ export async function createSandbox(
 
 /**
  * Remove the sandbox directory created by createSandbox.
- * Only removes directories whose path contains 'me-claude-sandbox-' as a safety guard.
+ * Only removes directories whose path starts with `<os.tmpdir()>/me-claude-sandbox-`
+ * as a safety guard against accidental recursive deletes.
  * Symlinks inside are removed along with the directory shell; the real data/ targets are untouched.
  */
 export async function destroySandbox(sandboxDir: string): Promise<void> {
-  if (!sandboxDir.includes('me-claude-sandbox-')) {
+  const expectedPrefix = path.join(os.tmpdir(), 'me-claude-sandbox-');
+  if (!sandboxDir.startsWith(expectedPrefix)) {
     throw new Error(`destroySandbox: unexpected path ${sandboxDir}`);
   }
   fs.rmSync(sandboxDir, { recursive: true, force: true });

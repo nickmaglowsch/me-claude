@@ -150,4 +150,12 @@ describe('RUNTIME_PROMPT delimiters', () => {
     expect(RUNTIME_PROMPT).toContain('<mention_message>');
     expect(RUNTIME_PROMPT).toContain('</mention_message>');
   });
+
+  it('new-contact memory template uses a plain H1, not an XML-wrapped name', () => {
+    // Pushname is already sanitized (src/sandbox.ts sanitizePushname), so the H1
+    // does not need a delimiter; wrapping would leak literal tags into the
+    // persisted memory file when Claude copies the template.
+    expect(RUNTIME_PROMPT).toContain('# {SENDER_NAME}');
+    expect(RUNTIME_PROMPT).not.toContain('# <sender_name>');
+  });
 });

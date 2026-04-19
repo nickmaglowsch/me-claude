@@ -473,9 +473,10 @@ async function main(): Promise<void> {
         trigger === 'ambient' ? AMBIENT_PROMPT_PREFIX + RUNTIME_PROMPT : RUNTIME_PROMPT;
       const callStart = Date.now();
       const sandboxDir = await createSandbox(vars.SENDER_JID, vars.GROUP_FOLDER);
+      const addDirs = [path.join(process.cwd(), 'data', 'contacts'), path.join(process.cwd(), 'data', 'groups')];
       let response = '';
       try {
-        response = await callClaudeWithTools(fillTemplate(promptTemplate, vars), sandboxDir);
+        response = await callClaudeWithTools(fillTemplate(promptTemplate, vars), sandboxDir, addDirs);
       } finally {
         await destroySandbox(sandboxDir).catch((e: Error) =>
           console.warn('[sandbox] cleanup failed:', e.message)

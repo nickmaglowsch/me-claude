@@ -89,7 +89,7 @@ Skip the memory update entirely if the exchange is trivial (e.g. mention on a me
 ## TEMPLATE for a new contact file
 
 \`\`\`
-# <sender_name>{SENDER_NAME}</sender_name>
+# {SENDER_NAME}
 
 ## Identity
 - JID: {SENDER_JID}

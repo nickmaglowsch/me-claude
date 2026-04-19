@@ -121,8 +121,13 @@ describe('createSandbox + destroySandbox', () => {
     expect(fs.existsSync(path.join(tmpProjectRoot, 'data', 'contacts'))).toBe(true);
   });
 
-  it('destroySandbox throws if path does not contain me-claude-sandbox-', async () => {
+  it('destroySandbox throws if path does not start with <tmpdir>/me-claude-sandbox-', async () => {
     await expect(destroySandbox('/tmp/some-other-dir')).rejects.toThrow('unexpected path');
+  });
+
+  it('destroySandbox throws if me-claude-sandbox- only appears mid-path (substring bypass attempt)', async () => {
+    // Previously a substring check would have accepted this; startsWith catches it.
+    await expect(destroySandbox('/etc/me-claude-sandbox-foo')).rejects.toThrow('unexpected path');
   });
 
   it('two createSandbox calls produce distinct directories', async () => {

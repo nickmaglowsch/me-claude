@@ -38,6 +38,12 @@ function resolvedConfigPath(): string {
   return path.join(process.cwd(), AMBIENT_CONFIG_PATH);
 }
 
+// Caps mirror the add-time limits in cmdTopic (src/commands.ts) so a hand-edited
+// config cannot bypass them. Values over the caps are truncated at load time with
+// a warning; the config itself remains valid.
+const MAX_TOPIC_LENGTH = 64;
+const MAX_TOPIC_BANK = 200;
+
 function isValidAmbientConfig(obj: unknown): obj is AmbientConfig {
   if (typeof obj !== 'object' || obj === null) return false;
   const c = obj as Record<string, unknown>;
@@ -54,6 +60,20 @@ function isValidAmbientConfig(obj: unknown): obj is AmbientConfig {
   );
 }
 
+function clampExplicitTopics(cfg: AmbientConfig): AmbientConfig {
+  const kept = cfg.explicitTopics
+    .filter((t): t is string => typeof t === 'string' && t.length <= MAX_TOPIC_LENGTH)
+    .slice(0, MAX_TOPIC_BANK);
+  if (kept.length !== cfg.explicitTopics.length) {
+    console.warn(
+      `[ambient] explicitTopics truncated to ${kept.length}/${cfg.explicitTopics.length} ` +
+      `(cap: ${MAX_TOPIC_BANK} entries, ${MAX_TOPIC_LENGTH} chars each)`
+    );
+    return { ...cfg, explicitTopics: kept };
+  }
+  return cfg;
+}
+
 export function loadAmbientConfig(): AmbientConfig {
   const cfgPath = resolvedConfigPath();
   try {
@@ -63,7 +83,7 @@ export function loadAmbientConfig(): AmbientConfig {
       console.warn('[ambient] ambient-config.json failed schema validation, using defaults');
       return defaultAmbientConfig();
     }
-    return parsed;
+    return clampExplicitTopics(parsed);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
