@@ -93,6 +93,16 @@ export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// mention/reply triggers use `msg.reply(...)` so the outbound message quotes
+// the triggering message — that's the expected UX when someone @'s Nick or
+// replies to him. Ambient triggers weren't invited into the thread, so we
+// send a plain group message instead of quoting.
+export type DispatchMode = 'reply' | 'send';
+
+export function pickDispatchMode(trigger: 'mention' | 'reply' | 'ambient'): DispatchMode {
+  return trigger === 'ambient' ? 'send' : 'reply';
+}
+
 // Memory read/write is now handled by Claude itself via Read/Edit/Write tools
 // in callClaudeWithTools. We no longer pre-load memory files or post-write them
 // from here — Claude decides what to read and what to update on its own.
@@ -481,7 +491,11 @@ async function main(): Promise<void> {
         return;
       }
 
-      const sentMsg = await msg.reply(reply);
+      const dispatchMode = pickDispatchMode(trigger);
+      const sentMsg =
+        dispatchMode === 'reply'
+          ? await msg.reply(reply)
+          : await chat.sendMessage(reply);
       // Track outbound ID for recursion guard
       const sentId = sentMsg?.id?._serialized;
       if (sentId) {
