@@ -134,6 +134,37 @@ export function pickDispatchMode(trigger: 'mention' | 'reply' | 'ambient'): Disp
   return trigger === 'ambient' ? 'send' : 'reply';
 }
 
+// Claude's prompt says to output "" to decline, but the model sometimes narrates
+// the decline instead ("Empty response - this is an ambient trigger..."). Those
+// strings then get sent to the group and make the bot look broken. Detect
+// common decline-narration openings and treat them as silent.
+//
+// Match only the first line to avoid over-aggressive filtering on legitimate
+// replies that happen to mention these phrases later. Patterns are anchored to
+// the start of the trimmed reply.
+// `APOS` matches straight ASCII apostrophe OR Unicode right-single-quote (U+2019).
+// Claude occasionally outputs curly quotes; both forms need to be caught.
+const APOS = "['’]";
+const DECLINE_NARRATION_PATTERNS: RegExp[] = [
+  /^empty\s+response\b/i,
+  /^no\s+response\b/i,
+  /^no\s+reply\b/i,
+  /^not\s+(replying|responding)\b/i,
+  /^staying\s+silent\b/i,
+  new RegExp(`^i${APOS}?ll\\s+stay\\s+silent\\b`, 'i'),
+  new RegExp(`^i${APOS}?m\\s+not\\s+(going\\s+to\\s+reply|replying|responding)\\b`, 'i'),
+  new RegExp(`^this\\s+doesn${APOS}?t\\s+(warrant|need|require)\\s+(a\\s+)?(response|reply)\\b`, 'i'),
+  /^nothing\s+(to\s+(add|say|reply)|worth\s+saying)\b/i,
+  /^skipping\s+this\b/i,
+  /^declin(e|ing)\s+to\s+(respond|reply)\b/i,
+];
+
+export function looksLikeDeclineNarration(reply: string): boolean {
+  const firstLine = reply.split('\n', 1)[0]?.trim() ?? '';
+  if (!firstLine) return false;
+  return DECLINE_NARRATION_PATTERNS.some(re => re.test(firstLine));
+}
+
 // Memory read/write is now handled by Claude itself via Read/Edit/Write tools
 // in callClaudeWithTools. We no longer pre-load memory files or post-write them
 // from here — Claude decides what to read and what to update on its own.
@@ -587,7 +618,23 @@ async function main(): Promise<void> {
         );
       }
       const callDurationMs = Date.now() - callStart;
-      const reply = response.trim();
+      let reply = response.trim();
+
+      // Claude is supposed to output "" to decline, but sometimes narrates
+      // the decline ("Empty response - this is an ambient trigger...") which
+      // then gets sent to the group. Strip those obvious patterns and treat
+      // as silent.
+      if (reply && looksLikeDeclineNarration(reply)) {
+        dbg(`decline narration detected, treating as silent: "${reply.slice(0, 80)}"`);
+        logEvent({
+          kind: 'decline.narration_filtered',
+          chat: chat.name,
+          chat_id: groupJid,
+          trigger,
+          preview: reply.slice(0, 120),
+        });
+        reply = '';
+      }
 
       // Silence is allowed — if Claude returns empty, skip. Release the
       // reserved limit slot so a silent reply doesn't burn the group's cap.
